@@ -67,10 +67,21 @@ pub async fn map_sso_result(
         };
     }
 
-    // If preferred_username is absent, fall back to `email`
-    let preferred_username = get_claim!(preferred_username)
-        .map(|x| x.as_str())
-        .map(ToString::to_string)
+    // Username resolution order:
+    // 1. Custom username_claim from SSO config (if configured)
+    //    Read from raw ID token JSON — NOT via serde(flatten) which could
+    //    allow malicious OIDC claims to shadow typed fields like warpgate_roles.
+    // 2. preferred_username standard claim
+    // 3. email as fallback
+    let custom_username =
+        resolve_custom_username(config.username_claim(), result.raw_id_token_claims.as_ref());
+
+    let preferred_username = custom_username
+        .or_else(|| {
+            get_claim!(preferred_username)
+                .map(|x| x.as_str())
+                .map(ToString::to_string)
+        })
         .or_else(|| {
             get_claim!(email)
                 .map(|x| x.as_str())
@@ -119,6 +130,68 @@ pub async fn map_sso_result(
     }
 }
 
+/// Resolve the operator-configured custom username claim out of the raw ID
+/// token JSON, warning on every way it can fail to resolve.
+///
+/// The diagnostic matters more than a usual lost log line. This is the whole
+/// username path for a provider mapped onto a custom claim (such as
+/// `username_claim: "EXTRAUsername"`), and when it yields nothing the caller
+/// silently falls through to `preferred_username` and then `email` — so a
+/// renamed, misspelled or non-string claim does not fail the login, it logs
+/// the user in under a *different* username. That is close to undiagnosable
+/// from outside the process, hence one warning per failure mode, each naming
+/// the claim.
+///
+/// The claim *value* is a username and is never logged; the claim *name* and
+/// the set of names actually present are (matching `extract_groups` below).
+/// An unconfigured `username_claim` is the normal path and stays silent.
+fn resolve_custom_username(
+    claim_name: Option<&str>,
+    raw_id_token_claims: Option<&serde_json::Value>,
+) -> Option<String> {
+    let claim_name = claim_name?;
+
+    let Some(claims) = raw_id_token_claims else {
+        warn!(
+            "`username_claim` is set to {claim_name:?} but no raw ID token claims are available; falling back to preferred_username/email"
+        );
+        return None;
+    };
+
+    let Some(value) = claims.get(claim_name) else {
+        warn!(
+            "`username_claim` {claim_name:?} is not present in the ID token claims; falling back to preferred_username/email. Claims present: {:?}",
+            claims
+                .as_object()
+                .map(|o| o.keys().collect::<Vec<_>>())
+                .unwrap_or_default(),
+        );
+        return None;
+    };
+
+    let Some(username) = value.as_str() else {
+        warn!(
+            "`username_claim` {claim_name:?} is present but is not a JSON string (it is a {}); falling back to preferred_username/email",
+            json_type_name(value),
+        );
+        return None;
+    };
+
+    Some(username.to_owned())
+}
+
+/// Name a JSON value's type for diagnostics, without revealing its contents.
+const fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
 fn extract_groups(result: &SsoResult, claim: &str, warn_if_missing: bool) -> Option<Vec<String>> {
     let userinfo_claims = result
         .userinfo_claims
@@ -150,6 +223,57 @@ fn extract_groups(result: &SsoResult, claim: &str, warn_if_missing: bool) -> Opt
         Err(e) => {
             warn!("Claim {claim:?} is not a list of role names, ignoring: {e}");
             None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::resolve_custom_username;
+
+    #[test]
+    fn a_configured_string_claim_resolves() {
+        let claims = json!({"EXTRAUsername": "alice", "email": "alice@example.com"});
+        assert_eq!(
+            resolve_custom_username(Some("EXTRAUsername"), Some(&claims)),
+            Some("alice".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_unconfigured_claim_resolves_to_none_without_inspecting_claims() {
+        // The normal path: no `username_claim`, so the caller falls through to
+        // `preferred_username`. This must not warn.
+        let claims = json!({"EXTRAUsername": "alice"});
+        assert_eq!(resolve_custom_username(None, Some(&claims)), None);
+        assert_eq!(resolve_custom_username(None, None), None);
+    }
+
+    #[test]
+    fn a_configured_claim_with_no_raw_claims_at_all_resolves_to_none() {
+        assert_eq!(resolve_custom_username(Some("EXTRAUsername"), None), None);
+    }
+
+    #[test]
+    fn a_configured_claim_absent_from_the_token_resolves_to_none() {
+        let claims = json!({"preferred_username": "alice@example.com"});
+        assert_eq!(
+            resolve_custom_username(Some("EXTRAUsername"), Some(&claims)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_configured_claim_that_is_not_a_string_resolves_to_none() {
+        for value in [json!(42), json!(null), json!(["alice"]), json!({"u": 1})] {
+            let claims = json!({"EXTRAUsername": value});
+            assert_eq!(
+                resolve_custom_username(Some("EXTRAUsername"), Some(&claims)),
+                None,
+                "non-string claim {value} must not be used as a username"
+            );
         }
     }
 }
