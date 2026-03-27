@@ -129,6 +129,11 @@ pub enum SsoInternalProviderConfig {
         additional_trusted_audiences: Option<Vec<String>>,
         #[serde(default)]
         trust_unknown_audiences: bool,
+        /// Custom claim name to use as the Warpgate username.
+        /// If set, this claim is read from the ID token/userinfo and used
+        /// instead of preferred_username. Falls back to preferred_username then email.
+        #[serde(default)]
+        username_claim: Option<String>,
     },
 }
 
@@ -273,6 +278,16 @@ impl SsoInternalProviderConfig {
         match self {
             Self::Apple { .. } => false,
             _ => true,
+        }
+    }
+
+    #[inline]
+    pub fn username_claim(&self) -> Option<&str> {
+        match self {
+            SsoInternalProviderConfig::Custom { username_claim, .. } => {
+                username_claim.as_deref()
+            }
+            _ => None,
         }
     }
 
