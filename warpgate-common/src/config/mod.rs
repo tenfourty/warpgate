@@ -443,6 +443,10 @@ pub struct SshConfig {
     #[serde(default, with = "humantime_serde")]
     #[schemars(with = "Option<String>")]
     pub keepalive_interval: Option<Duration>,
+
+    /// Default SSH target name when no target is specified (e.g., `ssh warpgate` instead of `ssh user:target@warpgate`)
+    #[serde(default)]
+    pub default_target: Option<String>,
 }
 
 impl Default for SshConfig {
@@ -457,6 +461,7 @@ impl Default for SshConfig {
             external_host: None,
             inactivity_timeout: _default_ssh_inactivity_timeout(),
             keepalive_interval: None,
+            default_target: None,
         }
     }
 }

@@ -41,6 +41,10 @@ pub struct TargetSSHOptions {
     pub auth: SSHTargetAuth,
     #[serde(default)]
     pub jump_host: Option<Uuid>,
+
+    /// Custom environment variables to inject into downstream SSH sessions
+    #[serde(default)]
+    pub env: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Union)]
