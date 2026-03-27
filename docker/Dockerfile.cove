@@ -1,0 +1,51 @@
+# Cove-patched Warpgate build
+# Based on the official Dockerfile with our patches already applied in the source tree
+FROM rust:1.85.0-bullseye AS build
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates-java nodejs openjdk-17-jdk \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY . /opt/warpgate
+
+WORKDIR /opt/warpgate/warpgate-web
+
+# Build frontend (match original Dockerfile: npm ci, openapi clients, vite build)
+RUN npm ci \
+    && npm run openapi:client:admin \
+    && npm run openapi:client:gateway \
+    && npm run build
+
+WORKDIR /opt/warpgate
+
+# Build Rust binary
+RUN cargo build --release
+
+FROM debian:bullseye-slim
+LABEL maintainer="cove-patched"
+ARG USER_ID=1000
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get -y update -qq \
+    && apt-get install --no-install-recommends --no-install-suggests -y ca-certificates \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN adduser warpgate --disabled-password --gecos "" --uid ${USER_ID} --home /data --shell /usr/sbin/nologin
+
+COPY --from=build /opt/warpgate/target/release/warpgate /usr/local/bin/warpgate
+
+VOLUME /data
+
+ENV WARPGATE_CONFIG=/data/warpgate.yaml
+ENV DOCKER=1
+
+HEALTHCHECK CMD warpgate healthcheck
+
+USER warpgate
+ENTRYPOINT ["warpgate"]
+CMD ["run"]
