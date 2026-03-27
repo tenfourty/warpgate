@@ -29,6 +29,7 @@ impl SsoLoginRequest {
     }
 
     pub async fn verify_code(self, code: String) -> Result<SsoLoginResponse, SsoError> {
+        let username_claim_name = self.config.username_claim().map(ToString::to_string);
         let config = self.config;
         let result = SsoClient::new(config.clone())?
             .finish_login(self.pkce_verifier, self.redirect_url, &self.nonce, code)
@@ -46,10 +47,27 @@ impl SsoLoginRequest {
             };
         }
 
-        // If preferred_username is absent, fall back to `email`
-        let preferred_username = get_claim!(preferred_username)
-            .map(|x| x.as_str())
-            .map(ToString::to_string)
+        // Username resolution order:
+        // 1. Custom username_claim from SSO config (if configured)
+        //    Read from raw ID token JSON — NOT via serde(flatten) which could
+        //    allow malicious OIDC claims to shadow typed fields like warpgate_roles.
+        // 2. preferred_username standard claim
+        // 3. email as fallback
+        let custom_username = username_claim_name.as_deref().and_then(|claim_name| {
+            result
+                .raw_id_token_claims
+                .as_ref()
+                .and_then(|claims| claims.get(claim_name))
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string)
+        });
+
+        let preferred_username = custom_username
+            .or_else(|| {
+                get_claim!(preferred_username)
+                    .map(|x| x.as_str())
+                    .map(ToString::to_string)
+            })
             .or_else(|| {
                 get_claim!(email)
                     .map(|x| x.as_str())
