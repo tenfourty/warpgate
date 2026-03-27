@@ -91,6 +91,7 @@ pub enum TrafficRecorderKey {
 pub struct ServerSession {
     pub id: SessionId,
     username: Option<String>,
+    authentication_type: Option<String>,
     session_handle: Option<russh::server::Handle>,
     pty_channels: Vec<Uuid>,
     all_channels: Vec<Uuid>,
@@ -166,6 +167,7 @@ impl ServerSession {
         let mut this = Self {
             id,
             username: None,
+            authentication_type: None,
             session_handle: None,
             pty_channels: vec![],
             all_channels: vec![],
@@ -711,6 +713,8 @@ impl ServerSession {
                 let channel_id = self.map_channel(server_channel_id)?;
                 self.maybe_connect_remote().await?;
                 self.maybe_start_target_selection_menu(channel_id).await?;
+
+                self.inject_own_env(channel_id);
 
                 let _ = self.send_command(RCCommand::Channel(
                     channel_id,
@@ -1377,6 +1381,7 @@ impl ServerSession {
         let is_scp = command == "scp" || command.starts_with("scp ");
         let _ = self.maybe_connect_remote().await;
         self.maybe_start_target_selection_menu(channel_id).await?;
+        self.inject_own_env(channel_id);
         let _ = self.send_command(RCCommand::Channel(
             channel_id,
             ChannelOperation::RequestExec(command.to_string()),
@@ -1469,6 +1474,42 @@ impl ServerSession {
         ))
         .await?;
         Ok(())
+    }
+
+    /// Inject Warpgate identity and custom environment variables into the downstream SSH session.
+    /// Mirrors inject_own_headers() in the HTTP proxy.
+    fn inject_own_env(&mut self, channel_id: Uuid) {
+        // Collect all env vars first to avoid borrow conflicts with send_command
+        let mut env_vars: Vec<(String, String)> = Vec::new();
+
+        // Built-in: WARPGATE_USERNAME
+        if let Some(ref username) = self.username {
+            env_vars.push(("WARPGATE_USERNAME".to_string(), username.clone()));
+        }
+
+        // Built-in: WARPGATE_AUTHENTICATION_TYPE
+        if let Some(ref auth_type) = self.authentication_type {
+            env_vars.push(("WARPGATE_AUTHENTICATION_TYPE".to_string(), auth_type.clone()));
+        }
+
+        // Custom env vars from target SSH config
+        if let TargetSelection::Found(ref target) = self.target {
+            if let TargetOptions::Ssh(ref ssh_options) = target.options {
+                if let Some(ref env) = ssh_options.env {
+                    for (name, value) in env {
+                        env_vars.push((name.clone(), value.clone()));
+                    }
+                }
+            }
+        }
+
+        // Send all env vars
+        for (name, value) in env_vars {
+            let _ = self.send_command(RCCommand::Channel(
+                channel_id,
+                ChannelOperation::RequestEnv(name, value),
+            ));
+        }
     }
 
     async fn traffic_recorder_for(
@@ -1982,6 +2023,19 @@ impl ServerSession {
                     return Ok(AuthResult::Rejected);
                 }
 
+                // Resolve default SSH target when no target is specified
+                let resolved_target_name = if target_name.is_empty() {
+                    let config = self.services.config.lock().await;
+                    if let Some(ref default) = config.store.ssh.default_target {
+                        info!("No target specified, using default SSH target: {}", default);
+                        default.clone()
+                    } else {
+                        target_name.clone()
+                    }
+                } else {
+                    target_name.clone()
+                };
+
                 let state_arc = self
                     .get_auth_state(
                         username,
@@ -2025,24 +2079,25 @@ impl ServerSession {
                             .await
                             .complete(state.id())
                             .await;
-                        if !target_name.is_empty() {
+                        if !resolved_target_name.is_empty() {
                             let target_auth_result = {
                                 self.services
                                     .config_provider
                                     .lock()
                                     .await
-                                    .authorize_target(&user_info.username, target_name)
+                                    .authorize_target(&user_info.username, &resolved_target_name)
                                     .await?
                             };
                             if !target_auth_result {
                                 warn!(
                                     "Target {} not authorized for user {}",
-                                    target_name, username
+                                    resolved_target_name, username
                                 );
                                 return Ok(AuthResult::Rejected);
                             }
                         }
-                        self._auth_accept(user_info.clone(), target_name).await?;
+                        self._auth_accept(user_info.clone(), &resolved_target_name).await?;
+                        self.authentication_type = Some("user".to_string());
                         Ok(AuthResult::Accepted { user_info })
                     }
                     x => Ok(x),
@@ -2054,7 +2109,7 @@ impl ServerSession {
                         info!("Authorized for {} with a ticket", target.name);
                         consume_ticket(&self.services.db, &ticket.id).await?;
                         self._auth_accept(user_info.clone(), &target.name).await?;
-
+                        self.authentication_type = Some("ticket".to_string());
                         Ok(AuthResult::Accepted { user_info })
                     }
                     None => Ok(AuthResult::Rejected),
