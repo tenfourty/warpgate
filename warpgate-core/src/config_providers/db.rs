@@ -12,7 +12,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use warpgate_common::auth::{
     AllCredentialsPolicy, AnySingleCredentialPolicy, AuthCredential, CredentialKind,
-    CredentialPolicy, PerProtocolCredentialPolicy,
+    CredentialMatch, CredentialPolicy, PerProtocolCredentialPolicy,
 };
 use warpgate_common::helpers::hash::verify_password_hash;
 use warpgate_common::helpers::otp::verify_totp;
@@ -391,7 +391,7 @@ impl ConfigProvider for DatabaseConfigProvider {
         &mut self,
         username: &str,
         client_credential: &AuthCredential,
-    ) -> Result<bool, WarpgateError> {
+    ) -> Result<Option<CredentialMatch>, WarpgateError> {
         let db = self.db.lock().await;
 
         let user_model = entities::User::Entity::find()
@@ -401,7 +401,7 @@ impl ConfigProvider for DatabaseConfigProvider {
 
         let Some(user_model) = user_model else {
             error!("Selected user not found: {}", username);
-            return Ok(false);
+            return Ok(None);
         };
 
         // Sync SSH keys from LDAP if user is linked
@@ -421,8 +421,6 @@ impl ConfigProvider for DatabaseConfigProvider {
             }
         }
 
-        let user_details = user_model.load_details(&db).await?;
-
         match client_credential {
             AuthCredential::PublicKey {
                 kind,
@@ -431,28 +429,38 @@ impl ConfigProvider for DatabaseConfigProvider {
                 let base64_bytes = BASE64.encode(public_key_bytes);
                 let openssh_public_key = format!("{kind} {base64_bytes}");
                 debug!(
-                    username = &user_details.username[..],
+                    username = &user_model.username[..],
                     "Client key: {}", openssh_public_key
                 );
 
-                Ok(user_details
-                    .credentials
-                    .iter()
-                    .any(|credential| match credential {
-                        UserAuthCredential::PublicKey(UserPublicKeyCredential {
-                            key: ref user_key,
-                        }) => &openssh_public_key == user_key.expose_secret(),
-                        _ => false,
-                    }))
+                // Query the pubkey rows directly so we can return the matched
+                // row id (needed by per-pubkey step-up auth). On duplicate
+                // rows with the same bytes (operator error) the smallest id
+                // wins — ORDER BY id makes the choice deterministic so A1
+                // stamps last_sso_at on the same row every time.
+                let matched = entities::PublicKeyCredential::Entity::find()
+                    .filter(entities::PublicKeyCredential::Column::UserId.eq(user_model.id))
+                    .filter(
+                        entities::PublicKeyCredential::Column::OpensshPublicKey
+                            .eq(openssh_public_key),
+                    )
+                    .order_by_asc(entities::PublicKeyCredential::Column::Id)
+                    .one(&*db)
+                    .await?;
+
+                Ok(matched.map(|row| CredentialMatch {
+                    kind: CredentialKind::PublicKey,
+                    credential_id: Some(row.id),
+                }))
             }
             AuthCredential::Password(client_password) => {
-                Ok(user_details
-                    .credentials
-                    .iter()
-                    .any(|credential| match credential {
+                let user_details = user_model.load_details(&db).await?;
+                let matched = user_details.credentials.iter().any(|credential| {
+                    matches!(
+                        credential,
                         UserAuthCredential::Password(UserPasswordCredential {
-                            hash: ref user_password_hash,
-                        }) => verify_password_hash(
+                            hash: user_password_hash,
+                        }) if verify_password_hash(
                             client_password.expose_secret(),
                             user_password_hash.expose_secret(),
                         )
@@ -462,25 +470,34 @@ impl ConfigProvider for DatabaseConfigProvider {
                                 "Error verifying password hash: {}", e
                             );
                             false
-                        }),
-                        _ => false,
-                    }))
+                        })
+                    )
+                });
+                Ok(matched.then_some(CredentialMatch {
+                    kind: CredentialKind::Password,
+                    credential_id: None,
+                }))
             }
             AuthCredential::Otp(client_otp) => {
-                Ok(user_details
-                    .credentials
-                    .iter()
-                    .any(|credential| match credential {
+                let user_details = user_model.load_details(&db).await?;
+                let matched = user_details.credentials.iter().any(|credential| {
+                    matches!(
+                        credential,
                         UserAuthCredential::Totp(UserTotpCredential {
-                            key: ref user_otp_key,
-                        }) => verify_totp(client_otp.expose_secret(), user_otp_key),
-                        _ => false,
-                    }))
+                            key: user_otp_key,
+                        }) if verify_totp(client_otp.expose_secret(), user_otp_key)
+                    )
+                });
+                Ok(matched.then_some(CredentialMatch {
+                    kind: CredentialKind::Totp,
+                    credential_id: None,
+                }))
             }
             AuthCredential::Sso {
                 provider: client_provider,
                 email: client_email,
             } => {
+                let user_details = user_model.load_details(&db).await?;
                 for credential in &user_details.credentials {
                     if let UserAuthCredential::Sso(UserSsoCredential {
                         ref provider,
@@ -490,11 +507,14 @@ impl ConfigProvider for DatabaseConfigProvider {
                         if provider.as_ref().unwrap_or(client_provider) == client_provider
                             && email == client_email
                         {
-                            return Ok(true);
+                            return Ok(Some(CredentialMatch {
+                                kind: CredentialKind::Sso,
+                                credential_id: None,
+                            }));
                         }
                     }
                 }
-                Ok(false)
+                Ok(None)
             }
             _ => Err(WarpgateError::InvalidCredentialType),
         }
@@ -756,5 +776,206 @@ impl ConfigProvider for DatabaseConfigProvider {
         };
 
         Ok(Some(user.try_into()?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use data_encoding::BASE64;
+    use russh::keys::{Algorithm, PrivateKey, PublicKeyBase64};
+    use sea_orm::{Database, Set};
+    use warpgate_common::auth::CredentialMatch;
+    use warpgate_common::helpers::hash::hash_password;
+    use warpgate_common::helpers::rng::get_crypto_rng;
+    use warpgate_common::Secret;
+    use warpgate_db_migrations::migrate_database;
+
+    use super::*;
+
+    /// Spin up a fresh in-memory sqlite DB with migrations applied.
+    async fn setup_db() -> Arc<Mutex<DatabaseConnection>> {
+        let conn = Database::connect("sqlite::memory:").await.unwrap();
+        migrate_database(&conn).await.unwrap();
+        Arc::new(Mutex::new(conn))
+    }
+
+    /// Insert a user with the given username, return the row id.
+    async fn insert_user(db: &DatabaseConnection, username: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        entities::User::ActiveModel {
+            id: Set(id),
+            username: Set(username.into()),
+            description: Set(String::new()),
+            credential_policy: Set(serde_json::json!({})),
+            rate_limit_bytes_per_second: Set(None),
+            ldap_server_id: Set(None),
+            ldap_object_uuid: Set(None),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        id
+    }
+
+    /// Insert a public-key credential row for the user, return (row id, key bytes).
+    async fn insert_pubkey(db: &DatabaseConnection, user_id: Uuid) -> (Uuid, Algorithm, Bytes) {
+        let key = PrivateKey::random(&mut get_crypto_rng(), Algorithm::Ed25519).unwrap();
+        let public_key = key.public_key();
+        let algorithm = public_key.algorithm();
+        let public_key_bytes = Bytes::from(public_key.public_key_bytes());
+        let base64_bytes = BASE64.encode(&public_key_bytes);
+        let openssh_public_key = format!("{algorithm} {base64_bytes}");
+
+        let id = Uuid::new_v4();
+        entities::PublicKeyCredential::ActiveModel {
+            id: Set(id),
+            user_id: Set(user_id),
+            label: Set("test key".into()),
+            date_added: Set(None),
+            last_used: Set(None),
+            openssh_public_key: Set(openssh_public_key),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+
+        (id, algorithm, public_key_bytes)
+    }
+
+    /// Insert a password credential row for the user, return the row id.
+    async fn insert_password(db: &DatabaseConnection, user_id: Uuid, password: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        entities::PasswordCredential::ActiveModel {
+            id: Set(id),
+            user_id: Set(user_id),
+            argon_hash: Set(hash_password(password)),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn unit_validate_credential_pubkey_returns_match_with_row_id() {
+        let db = setup_db().await;
+        let user_id = insert_user(&*db.lock().await, "alice").await;
+        let (pubkey_id, algorithm, key_bytes) = insert_pubkey(&*db.lock().await, user_id).await;
+
+        let mut provider = DatabaseConfigProvider::new(&db);
+        let cred = AuthCredential::PublicKey {
+            kind: algorithm,
+            public_key_bytes: key_bytes,
+        };
+
+        let result = provider.validate_credential("alice", &cred).await.unwrap();
+
+        assert_eq!(
+            result,
+            Some(CredentialMatch {
+                kind: CredentialKind::PublicKey,
+                credential_id: Some(pubkey_id),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn unit_validate_credential_pubkey_returns_none_when_no_match() {
+        let db = setup_db().await;
+        let user_id = insert_user(&*db.lock().await, "alice").await;
+        // Insert a real key so the user has at least one pubkey on file.
+        insert_pubkey(&*db.lock().await, user_id).await;
+
+        // Offer a *different* public key — should not match any row.
+        let other_key = PrivateKey::random(&mut get_crypto_rng(), Algorithm::Ed25519).unwrap();
+        let other_public_bytes = Bytes::from(other_key.public_key().public_key_bytes());
+        let cred = AuthCredential::PublicKey {
+            kind: other_key.public_key().algorithm(),
+            public_key_bytes: other_public_bytes,
+        };
+
+        let mut provider = DatabaseConfigProvider::new(&db);
+        let result = provider.validate_credential("alice", &cred).await.unwrap();
+
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn unit_validate_credential_pubkey_smallest_id_wins_on_duplicates() {
+        let db = setup_db().await;
+        let user_id = insert_user(&*db.lock().await, "alice").await;
+        // Insert the same pubkey bytes twice under different rows (simulating operator error).
+        let (first_id, algorithm, key_bytes) = insert_pubkey(&*db.lock().await, user_id).await;
+
+        // Dup: encode same key again with its own row id.
+        let base64_bytes = BASE64.encode(&key_bytes);
+        let openssh_public_key = format!("{algorithm} {base64_bytes}");
+        let dup_id = Uuid::new_v4();
+        entities::PublicKeyCredential::ActiveModel {
+            id: Set(dup_id),
+            user_id: Set(user_id),
+            label: Set("duplicate".into()),
+            date_added: Set(None),
+            last_used: Set(None),
+            openssh_public_key: Set(openssh_public_key),
+        }
+        .insert(&*db.lock().await)
+        .await
+        .unwrap();
+
+        let cred = AuthCredential::PublicKey {
+            kind: algorithm,
+            public_key_bytes: key_bytes,
+        };
+        let mut provider = DatabaseConfigProvider::new(&db);
+        let result = provider.validate_credential("alice", &cred).await.unwrap();
+
+        // On duplicate rows the smallest id wins — the query is ORDER BY id ASC,
+        // so the choice is deterministic across runs (A1 stamps last_sso_at on
+        // the same row every time, regardless of DB insertion order).
+        let matched = result.expect("expected a match");
+        assert_eq!(matched.kind, CredentialKind::PublicKey);
+        let id = matched.credential_id.expect("pubkey id populated");
+        let expected = std::cmp::min(first_id, dup_id);
+        assert_eq!(
+            id, expected,
+            "expected smallest id {expected} to win, got {id}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unit_validate_credential_password_returns_match_without_id() {
+        // For A0 we only need pubkey row ids; password matches still report Some
+        // (credential accepted) but credential_id is None until/unless a later
+        // step-up surface requires per-row password tracking.
+        let db = setup_db().await;
+        let user_id = insert_user(&*db.lock().await, "bob").await;
+        insert_password(&*db.lock().await, user_id, "hunter2").await;
+
+        let mut provider = DatabaseConfigProvider::new(&db);
+        let cred = AuthCredential::Password(Secret::new("hunter2".into()));
+        let result = provider.validate_credential("bob", &cred).await.unwrap();
+
+        assert_eq!(
+            result,
+            Some(CredentialMatch {
+                kind: CredentialKind::Password,
+                credential_id: None,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn unit_validate_credential_password_returns_none_on_wrong_password() {
+        let db = setup_db().await;
+        let user_id = insert_user(&*db.lock().await, "bob").await;
+        insert_password(&*db.lock().await, user_id, "hunter2").await;
+
+        let mut provider = DatabaseConfigProvider::new(&db);
+        let cred = AuthCredential::Password(Secret::new("wrong".into()));
+        let result = provider.validate_credential("bob", &cred).await.unwrap();
+
+        assert_eq!(result, None);
     }
 }
