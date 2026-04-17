@@ -2,12 +2,13 @@ use poem::session::Session;
 use poem::web::{Data, FromRequest};
 use poem::{Endpoint, Middleware, Request};
 use serde::Deserialize;
-use warpgate_common::Secret;
+use warpgate_common::{Secret, SessionId};
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::SessionAuthorization;
 use warpgate_core::{authorize_ticket, consume_ticket};
 
 use crate::common::SessionExt;
+use crate::session::SESSION_ID_SESSION_KEY;
 
 pub struct TicketMiddleware {}
 
@@ -61,7 +62,7 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
             }
 
             if let Some(ticket) = ticket_value {
-                if let Some((_ticket_model, target, user_info)) = {
+                if let Some((ticket_model, target, user_info)) = {
                     let ticket_secret = Secret::new(ticket);
                     if let Some((ticket, target, user_info)) =
                         authorize_ticket(&ctx.services().db, &ticket_secret).await?
@@ -77,6 +78,18 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
                         username: user_info.username,
                         target_name: target.name,
                     });
+                    if let Some(session_id) = session.get::<SessionId>(SESSION_ID_SESSION_KEY) {
+                        if let Err(error) = ctx
+                            .services()
+                            .state
+                            .lock()
+                            .await
+                            .set_ticket_id_for_session(session_id, ticket_model.id)
+                            .await
+                        {
+                            tracing::error!(%error, "Failed to persist ticket_id on session");
+                        }
+                    }
                 }
             }
         }
