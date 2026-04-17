@@ -252,7 +252,7 @@ impl Api {
             )));
         }
 
-        if cp.validate_credential(&username, &cred).await? {
+        if cp.validate_credential(&username, &cred).await?.is_some() {
             state.add_valid_credential(cred);
         } else {
             return Ok(Err(format!(
