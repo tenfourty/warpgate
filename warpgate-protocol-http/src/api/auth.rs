@@ -164,6 +164,7 @@ impl Api {
         if cp
             .validate_credential(&state.user_info().username, &password_cred)
             .await?
+            .is_some()
         {
             state.add_valid_credential(password_cred);
         }
@@ -210,6 +211,7 @@ impl Api {
         if cp
             .validate_credential(&state.user_info().username, &otp_cred)
             .await?
+            .is_some()
         {
             state.add_valid_credential(otp_cred);
         } else {

@@ -204,6 +204,7 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin> PostgresSession<S> {
                                     .await
                                     .validate_credential(&username, &credential)
                                     .await?
+                                    .is_some()
                                 {
                                     state.add_valid_credential(credential);
                                 } else {
