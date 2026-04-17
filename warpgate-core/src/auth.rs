@@ -10,7 +10,8 @@ pub async fn validate_and_add_credential<C: ConfigProvider>(
 ) -> Result<bool, WarpgateError> {
     let credential_valid = cp
         .validate_credential(&state.user_info().username, credential)
-        .await?;
+        .await?
+        .is_some();
 
     if credential_valid {
         state.add_valid_credential(credential.clone());

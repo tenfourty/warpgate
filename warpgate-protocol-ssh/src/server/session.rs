@@ -1948,7 +1948,8 @@ impl ServerSession {
                         .lock()
                         .await
                         .validate_credential(username, &credential)
-                        .await?);
+                        .await?
+                        .is_some());
                 }
 
                 Ok(false)
