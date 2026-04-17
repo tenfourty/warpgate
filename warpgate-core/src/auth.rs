@@ -10,7 +10,9 @@ pub async fn submit_credential<C: ConfigProvider>(
 ) -> Result<SubmitOutcome, WarpgateError> {
     state
         .submit_credential(credential, |username, credential| async move {
-            cp.validate_credential(&username, &credential).await
+            cp.validate_credential(&username, &credential)
+                .await
+                .map(|m| m.is_some())
         })
         .await
 }

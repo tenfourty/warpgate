@@ -84,6 +84,15 @@ mod m00077_session_user_target_id;
 mod m00078_assignment_composite_pks;
 mod m00079_unique_target_and_group_names;
 
+// cove-patch migrations. Their numeric prefixes are frozen: SeaORM identifies a
+// migration by its module-name string (`DeriveMigrationName`), and these names are
+// already recorded as applied on the shared Warpgate DB. Renumbering would rename
+// them, so the DB would treat them as new and re-run them - and the `last_sso_at`
+// column migrations are not idempotent (plain ALTER TABLE ... ADD COLUMN).
+// Position in the `migrations()` vec is what orders execution, not the name, so
+// these are registered last and a fresh DB simply applies them at the end.
+mod m00040_credentials_public_key_user_id_index;
+
 pub(crate) mod helpers;
 
 pub struct Migrator;
@@ -171,6 +180,8 @@ impl MigratorTrait for Migrator {
             Box::new(m00077_session_user_target_id::Migration),
             Box::new(m00078_assignment_composite_pks::Migration),
             Box::new(m00079_unique_target_and_group_names::Migration),
+            // cove-patch migrations registered after upstream's - see mod block above.
+            Box::new(m00040_credentials_public_key_user_id_index::Migration),
         ]
     }
 }

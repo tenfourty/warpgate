@@ -3,8 +3,26 @@ use poem_openapi::Enum;
 use russh::keys::Algorithm;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::{Secret, UserCertificateCredential};
+
+/// Result of a successful credential validation: which kind of credential
+/// matched and, when available, the primary-key row id of the matched
+/// credential in the database. Returned from
+/// [`ConfigProvider::validate_credential`](crate::ConfigProvider::validate_credential)
+/// so downstream code can stamp per-row metadata (e.g. step-up SSO freshness)
+/// on the exact credential that authenticated the user.
+///
+/// `credential_id` is optional: not every credential kind tracks a persistent
+/// row id yet. For now it is populated for `PublicKey` matches (required by
+/// the per-pubkey step-up feature). Other kinds return `None` until a use
+/// case drives adding per-row tracking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CredentialMatch {
+    pub kind: CredentialKind,
+    pub credential_id: Option<Uuid>,
+}
 
 #[derive(
     Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Enum,

@@ -13,7 +13,8 @@ use time::OffsetDateTime;
 use tracing::warn;
 use uuid::Uuid;
 use warpgate_common::auth::{
-    AuthCredential, AuthResult, AuthState, AuthStateUserInfo, CredentialKind, CredentialPolicy,
+    AuthCredential, AuthResult, AuthState, AuthStateUserInfo, CredentialKind, CredentialMatch,
+    CredentialPolicy,
 };
 use warpgate_common::helpers::hash::hash_secret;
 use warpgate_common::{Protocol, Secret, Target, User, WarpgateError};
@@ -41,11 +42,16 @@ pub trait ConfigProvider {
     async fn get_target_by_hostname(&self, hostname: &str)
     -> Result<Option<Target>, WarpgateError>;
 
+    /// Validate a presented client credential against the user's stored
+    /// credentials. Returns `Ok(Some(match))` on a successful match (with the
+    /// matched credential's kind and, when known, its DB row id) or
+    /// `Ok(None)` if no stored credential matches. Errors are reserved for
+    /// DB/config failures, not auth rejection.
     async fn validate_credential(
         &self,
         username: &str,
         client_credential: &AuthCredential,
-    ) -> Result<bool, WarpgateError>;
+    ) -> Result<Option<CredentialMatch>, WarpgateError>;
 
     async fn username_for_sso_credential(
         &self,

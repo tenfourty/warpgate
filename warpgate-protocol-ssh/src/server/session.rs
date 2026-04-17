@@ -2163,7 +2163,10 @@ impl ServerSession {
                 let cp = self.services.config_provider.clone();
 
                 if let Some(credential) = credential {
-                    return Ok(cp.validate_credential(username, &credential).await?);
+                    return Ok(cp
+                        .validate_credential(username, &credential)
+                        .await?
+                        .is_some());
                 }
 
                 Ok(false)
