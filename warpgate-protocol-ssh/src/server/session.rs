@@ -1753,6 +1753,11 @@ impl ServerSession {
                     Some((ticket, target, user_info)) => {
                         info!("Authorized for {} with a ticket", target.name);
                         consume_ticket(&self.services.db, &ticket.id).await?;
+                        self.server_handle
+                            .lock()
+                            .await
+                            .set_ticket_id(ticket.id)
+                            .await?;
                         self._auth_accept(user_info.clone(), &target.name).await?;
 
                         Ok(AuthResult::Accepted { user_info })

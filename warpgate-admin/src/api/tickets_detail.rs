@@ -62,6 +62,15 @@ impl Api {
             .emit();
         }
 
+        // Close any live sessions using this ticket before deleting the row
+        // (spec: Commit B — session termination on delete).
+        ctx.services()
+            .state
+            .lock()
+            .await
+            .close_sessions_for_ticket(ticket.id)
+            .await;
+
         ticket.delete(&*db).await?;
         Ok(DeleteTicketResponse::Deleted)
     }
