@@ -4,6 +4,7 @@ use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
 use tracing::{Instrument, info_span};
+use uuid::Uuid;
 use warpgate_common::auth::AuthStateUserInfo;
 use warpgate_common::{SessionId, Target, WarpgateError, redact_target_secrets};
 use warpgate_db_entities::Session;
@@ -95,6 +96,30 @@ impl WarpgateServerHandle {
         }
 
         self.update_rate_limiters().await
+    }
+
+    /// Associate this session with a ticket. Persists to `sessions.ticket_id`
+    /// so admin "delete ticket" can close matching live sessions.
+    pub async fn set_ticket_id(&self, ticket_id: Uuid) -> Result<(), WarpgateError> {
+        use sea_orm::ActiveValue::Set;
+
+        let mut state = self.session_state.lock().await;
+        if state.ticket_id == Some(ticket_id) {
+            return Ok(());
+        }
+
+        Session::Entity::update_many()
+            .set(Session::ActiveModel {
+                ticket_id: Set(Some(ticket_id)),
+                ..Default::default()
+            })
+            .filter(Session::Column::Id.eq(self.id))
+            .exec(&self.db)
+            .await?;
+
+        state.ticket_id = Some(ticket_id);
+        state.emit_change();
+        Ok(())
     }
 
     pub async fn set_target(&self, target: &Target) -> Result<(), WarpgateError> {

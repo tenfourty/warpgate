@@ -4,13 +4,14 @@ use poem::session::Session;
 use poem::web::{Data, FromRequest};
 use poem::{Endpoint, Middleware, Request};
 use serde::Deserialize;
-use warpgate_common::Secret;
+use warpgate_common::{Secret, SessionId};
 use warpgate_common_http::SessionAuthorization;
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::logging::get_client_ip;
 use warpgate_core::{authorize_ticket, consume_ticket};
 
 use crate::common::SessionExt;
+use crate::session::SESSION_ID_SESSION_KEY;
 
 pub struct TicketMiddleware {}
 
@@ -64,7 +65,7 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
             }
 
             if let Some(ticket) = ticket_value
-                && let Some(authorization) = {
+                && let Some((ticket_id, authorization)) = {
                     let ticket_secret = Secret::new(ticket);
                     let client_ip: Option<IpAddr> = get_client_ip(&req, ctx.services())
                         .await
@@ -79,7 +80,7 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
                     .await?
                     {
                         consume_ticket(&ctx.services().db, &ticket.id).await?;
-                        Some(authorization)
+                        Some((ticket.id, authorization))
                     } else {
                         None
                     }
@@ -91,6 +92,19 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
                     username: user_info.username,
                     target_id: target.id,
                 });
+                // Record which ticket backs this live session so that deleting
+                // the ticket can close it.
+                if let Some(session_id) = session.get::<SessionId>(SESSION_ID_SESSION_KEY)
+                    && let Err(error) = ctx
+                        .services()
+                        .state
+                        .lock()
+                        .await
+                        .set_ticket_id_for_session(session_id, ticket_id)
+                        .await
+                {
+                    tracing::error!(%error, "Failed to persist ticket_id on session");
+                }
             }
         }
 

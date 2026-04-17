@@ -31,6 +31,7 @@ impl Api {
         &self,
         admin: AdminContext,
         id: Path<Uuid>,
+        req: &poem::Request,
     ) -> Result<DeleteTicketResponse, WarpgateError> {
         use warpgate_db_entities::Ticket;
 
@@ -56,6 +57,9 @@ impl Api {
             }
             .emit();
         }
+
+        // Close any live sessions using this ticket before deleting the row.
+        crate::api::sessions_list::close_sessions_for_ticket(&admin, req, ticket.id).await;
 
         delete_ticket(db, ticket.id).await?;
         Ok(DeleteTicketResponse::Deleted)

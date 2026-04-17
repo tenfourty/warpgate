@@ -206,6 +206,9 @@ pub async fn authenticate<P: DesktopProtocol>(
             {
                 Some((ticket, authorization)) => {
                     consume_ticket(&services.db, &ticket.id).await?;
+                    // Record which ticket backs this live session so that
+                    // deleting the ticket can close it.
+                    server_handle.lock().await.set_ticket_id(ticket.id).await?;
                     let Some(options) = P::options(authorization.target()) else {
                         bail!(
                             "Target {} is not a {} target",

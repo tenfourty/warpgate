@@ -2342,6 +2342,11 @@ impl ServerSession {
                             authorization.target().name
                         );
                         consume_ticket(&self.services.db, &ticket.id).await?;
+                        self.server_handle
+                            .lock()
+                            .await
+                            .set_ticket_id(ticket.id)
+                            .await?;
                         let user_info = authorization.user_info().clone();
                         self._auth_accept(user_info.clone(), Some(authorization))
                             .await?;

@@ -129,6 +129,17 @@ pub async fn run_db_authorization<T: DbAuthTransport>(
                 authorization.target().name
             );
             consume_ticket(&services.db, &ticket.id).await?;
+            // Record which ticket backs this live session so that deleting the
+            // ticket can close it.
+            if let Err(error) = services
+                .state
+                .lock()
+                .await
+                .set_ticket_id_for_session(session_id, ticket.id)
+                .await
+            {
+                error!(%error, "Failed to persist ticket_id on session");
+            }
             transport.send_auth_ok(AuthOkPermit).await?;
             Ok(Some(authorization))
         }

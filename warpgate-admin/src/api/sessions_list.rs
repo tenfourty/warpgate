@@ -4,13 +4,14 @@ use poem::session::Session;
 use poem::web::Data;
 use poem::web::websocket::{Message, WebSocket};
 use poem::{IntoResponse, handler};
-use poem_openapi::param::Query;
+use poem_openapi::param::{Path, Query};
 use poem_openapi::payload::Json;
 use poem_openapi::{ApiResponse, OpenApi};
 use sea_orm::prelude::Expr;
 use sea_orm::sea_query::Func;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 use tracing::warn;
+use uuid::Uuid;
 use warpgate_common::{AdminPermission, WarpgateError};
 use warpgate_common_http::AuthenticatedRequestContext;
 use warpgate_core::SessionSnapshot;
@@ -30,6 +31,12 @@ enum GetSessionsResponse {
 
 #[derive(ApiResponse)]
 enum CloseAllSessionsResponse {
+    #[oai(status = 201)]
+    Ok,
+}
+
+#[derive(ApiResponse)]
+enum CloseSessionsForResponse {
     #[oai(status = 201)]
     Ok,
 }
@@ -115,6 +122,112 @@ impl Api {
 
         Ok(CloseAllSessionsResponse::Ok)
     }
+
+    /// Close this node's live sessions belonging to a user. The cluster-wide
+    /// entry point is [`close_sessions_for_user`], which calls this on each peer.
+    #[oai(
+        path = "/sessions/for-user/:id",
+        method = "delete",
+        operation_id = "close_sessions_for_user"
+    )]
+    async fn api_close_sessions_for_user(
+        &self,
+        admin: ClusterOrAdminContext,
+        id: Path<Uuid>,
+    ) -> poem::Result<CloseSessionsForResponse> {
+        admin.require(AdminPermission::SessionsTerminate)?;
+
+        admin
+            .services()
+            .state
+            .lock()
+            .await
+            .close_sessions_for_user(id.0)
+            .await;
+
+        Ok(CloseSessionsForResponse::Ok)
+    }
+
+    /// Close this node's live sessions opened with a ticket. The cluster-wide
+    /// entry point is [`close_sessions_for_ticket`].
+    #[oai(
+        path = "/sessions/for-ticket/:id",
+        method = "delete",
+        operation_id = "close_sessions_for_ticket"
+    )]
+    async fn api_close_sessions_for_ticket(
+        &self,
+        admin: ClusterOrAdminContext,
+        id: Path<Uuid>,
+    ) -> poem::Result<CloseSessionsForResponse> {
+        admin.require(AdminPermission::SessionsTerminate)?;
+
+        admin
+            .services()
+            .state
+            .lock()
+            .await
+            .close_sessions_for_ticket(id.0)
+            .await;
+
+        Ok(CloseSessionsForResponse::Ok)
+    }
+}
+
+/// Close every live session belonging to `user_id`, on this node and on every peer.
+pub(crate) async fn close_sessions_for_user(
+    ctx: &AuthenticatedRequestContext,
+    req: &poem::Request,
+    user_id: Uuid,
+) {
+    ctx.services()
+        .state
+        .lock()
+        .await
+        .close_sessions_for_user(user_id)
+        .await;
+    close_on_peers_at(ctx, req, &format!("sessions/for-user/{user_id}")).await;
+}
+
+/// Close every live session opened with `ticket_id`, on this node and on every peer.
+pub(crate) async fn close_sessions_for_ticket(
+    ctx: &AuthenticatedRequestContext,
+    req: &poem::Request,
+    ticket_id: Uuid,
+) {
+    ctx.services()
+        .state
+        .lock()
+        .await
+        .close_sessions_for_ticket(ticket_id)
+        .await;
+    close_on_peers_at(ctx, req, &format!("sessions/for-ticket/{ticket_id}")).await;
+}
+
+/// Ask every other node to close its share of the sessions.
+///
+/// Best effort, for the same reason as [`close_on_peers`]: an unreachable peer is
+/// logged rather than failing the delete that triggered this.
+async fn close_on_peers_at(ctx: &AuthenticatedRequestContext, req: &poem::Request, suffix: &str) {
+    for (hostname, response) in
+        fan_out_to_peers(ctx, req, &admin_api_sibling_path(req, suffix)).await
+    {
+        if response.status() != StatusCode::CREATED {
+            let status = response.status();
+            warn!(node = %hostname, %status, "Failed to close sessions on a cluster node");
+        }
+    }
+}
+
+/// `/<mount>/admin/api/users/<id>` -> `/<mount>/admin/api/<suffix>`.
+///
+/// The admin API is mounted under two prefixes (`/@warpgate` and `/_warpgate`),
+/// so the peer path is derived from the incoming request rather than hardcoded.
+/// Both callers are two-segment routes (`users/:id`, `tickets/:id`).
+fn admin_api_sibling_path(req: &poem::Request, suffix: &str) -> String {
+    let path = req.original_uri().path();
+    let base = path.rsplitn(3, '/').last().unwrap_or_default();
+    format!("{base}/{suffix}")
 }
 
 /// Forward the close-all request to every other registered cluster node.

@@ -278,6 +278,7 @@ impl DetailApi {
         &self,
         admin: AdminContext,
         id: Path<Uuid>,
+        req: &poem::Request,
     ) -> Result<DeleteUserResponse, WarpgateError> {
         admin.require(AdminPermission::UsersDelete)?;
 
@@ -303,6 +304,10 @@ impl DetailApi {
             actor_user_id: admin.auth.user_id(),
         }
         .emit();
+
+        // Close any live sessions belonging to this user before the DB row is
+        // removed, or the connection keeps running with no user behind it.
+        crate::api::sessions_list::close_sessions_for_user(&admin, req, user.id).await;
 
         user.delete(db).await?;
 
