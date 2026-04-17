@@ -286,6 +286,15 @@ impl DetailApi {
         }
         .emit();
 
+        // Close any live sessions belonging to this user before the DB row is
+        // removed (spec: Commit B — session termination on delete).
+        ctx.services()
+            .state
+            .lock()
+            .await
+            .close_sessions_for_user(user.id)
+            .await;
+
         user.delete(&*db).await?;
 
         Ok(DeleteUserResponse::Deleted)

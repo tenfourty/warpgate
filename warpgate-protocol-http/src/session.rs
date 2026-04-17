@@ -63,7 +63,7 @@ pub struct SessionStore {
     this: Weak<Mutex<Self>>,
 }
 
-static SESSION_ID_SESSION_KEY: &str = "session_id";
+pub(crate) static SESSION_ID_SESSION_KEY: &str = "session_id";
 static REQUEST_COUNTER_SESSION_KEY: &str = "request_counter";
 
 impl SessionStore {
