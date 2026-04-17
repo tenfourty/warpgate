@@ -1651,7 +1651,8 @@ impl ServerSession {
                         .lock()
                         .await
                         .validate_credential(username, &credential)
-                        .await?);
+                        .await?
+                        .is_some());
                 }
 
                 Ok(false)
@@ -1712,6 +1713,7 @@ impl ServerSession {
                         .await
                         .validate_credential(username, &credential)
                         .await?
+                        .is_some()
                     {
                         state.add_valid_credential(credential);
                     }

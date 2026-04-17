@@ -209,7 +209,11 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin> MySqlSession<S> {
                     let credential = AuthCredential::Password(password);
 
                     let mut cp = self.services.config_provider.lock().await;
-                    if cp.validate_credential(&username, &credential).await? {
+                    if cp
+                        .validate_credential(&username, &credential)
+                        .await?
+                        .is_some()
+                    {
                         state.add_valid_credential(credential);
                     }
 
