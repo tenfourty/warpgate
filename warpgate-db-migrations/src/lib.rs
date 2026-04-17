@@ -61,6 +61,14 @@ mod m00056_web_ssh_enabled;
 mod m00057_password_login_mode;
 mod m00058_analytics;
 
+// cove-patch migrations. Numbered m00040+ on the old fork base; upstream v0.26.0
+// later claimed m00040–m00058 for its own migrations. SeaORM tracks applied
+// migrations by name string, so these keep their original names (already applied
+// on the shared Warpgate DB) and are registered AFTER m00058 — the live DB skips
+// them, and a fresh DB applies them last. Do NOT renumber: the last_sso_at
+// column migrations are not idempotent, and renaming would re-run them.
+mod m00040_credentials_public_key_user_id_index;
+
 pub(crate) mod helpers;
 
 pub struct Migrator;
@@ -127,6 +135,8 @@ impl MigratorTrait for Migrator {
             Box::new(m00056_web_ssh_enabled::Migration),
             Box::new(m00057_password_login_mode::Migration),
             Box::new(m00058_analytics::Migration),
+            // cove-patch migrations registered after upstream's — see mod block above.
+            Box::new(m00040_credentials_public_key_user_id_index::Migration),
         ]
     }
 }
