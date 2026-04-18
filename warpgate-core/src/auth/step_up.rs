@@ -1,13 +1,18 @@
 //! Step-up SSO freshness helpers for per-credential periodic re-auth.
 //!
-//! The SSH pubkey auth handler consults these helpers to decide whether a
-//! given `credentials_public_key` row must force a `WebUserApproval` step-up
-//! before accepting the session. Freshness is evaluated per credential row so
-//! that e.g. pubkey A on laptop 1 and pubkey B on laptop 2 hold independent
-//! 12h clocks.
+//! Protocol handlers consult these helpers to decide whether a given
+//! credential row must force an SSO / `WebUserApproval` step-up before
+//! accepting the session. Freshness is evaluated per credential row so that
+//! e.g. pubkey A on laptop 1 and pubkey B on laptop 2 — or cert A on
+//! kubectl config 1 and cert B on config 2 — hold independent clocks.
 //!
-//! Scope for Commit A1: SSH pubkey only. HTTP / Kube live on separate rows
-//! or session claims and will get their own helpers in later commits.
+//! Scope by commit:
+//! - Commit A1: SSH pubkey helpers (`get_pubkey_last_sso_at` /
+//!   `update_pubkey_last_sso_at`) against `credentials_public_key`.
+//! - Commit A3: Kubernetes cert helpers (`get_cert_last_sso_at` /
+//!   `update_cert_last_sso_at`) against `credentials_certificate`.
+//! - HTTP sessions are stamped on the in-memory Poem session claim instead
+//!   of a DB row (see `warpgate-protocol-http::step_up`).
 use std::time::Duration;
 
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
@@ -85,6 +90,59 @@ pub async fn update_pubkey_last_sso_at(
         tracing::debug!(
             %pubkey_id,
             "update_pubkey_last_sso_at: row vanished between validate and stamp, no-op"
+        );
+    }
+    Ok(result.rows_affected)
+}
+
+/// Read the `last_sso_at` column for the given cert credential row.
+///
+/// Returns `Ok(None)` if the row exists but was never stamped, or if the row
+/// no longer exists (defensive — a missing row cannot be fresh).
+///
+/// Mirror of [`get_pubkey_last_sso_at`] against `credentials_certificate`,
+/// consumed by the Kubernetes per-cert step-up gate.
+pub async fn get_cert_last_sso_at(
+    db: &DatabaseConnection,
+    cert_id: Uuid,
+) -> Result<Option<OffsetDateTime>, WarpgateError> {
+    let Some(row) = entities::CertificateCredential::Entity::find_by_id(cert_id)
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    Ok(row.last_sso_at)
+}
+
+/// Stamp `last_sso_at` on the given cert credential row.
+///
+/// Idempotent and forward-only: later stamps always overwrite earlier ones.
+/// Uses a single atomic UPDATE ... WHERE id = ? — one round trip, safe
+/// against concurrent validate/stamp races. Returns the number of rows
+/// affected; if the row vanished between validate and stamp (operator deleted
+/// the cert) the UPDATE affects zero rows. That's logged at debug and
+/// treated as a benign no-op so the auth flow doesn't fail hard on a race.
+///
+/// Mirror of [`update_pubkey_last_sso_at`] against `credentials_certificate`.
+pub async fn update_cert_last_sso_at(
+    db: &DatabaseConnection,
+    cert_id: Uuid,
+    now: OffsetDateTime,
+) -> Result<u64, WarpgateError> {
+    let result = entities::CertificateCredential::Entity::update_many()
+        .set(entities::CertificateCredential::ActiveModel {
+            last_sso_at: Set(Some(now)),
+            ..Default::default()
+        })
+        .filter(entities::CertificateCredential::Column::Id.eq(cert_id))
+        .exec(db)
+        .await?;
+
+    if result.rows_affected == 0 {
+        tracing::debug!(
+            %cert_id,
+            "update_cert_last_sso_at: row vanished between validate and stamp, no-op"
         );
     }
     Ok(result.rows_affected)
@@ -254,6 +312,101 @@ mod tests {
         let now = OffsetDateTime::now_utc();
 
         let rows_affected = update_pubkey_last_sso_at(&*db.lock().await, missing, now)
+            .await
+            .unwrap();
+        assert_eq!(rows_affected, 0);
+    }
+
+    async fn insert_user_and_cert(db: &DatabaseConnection) -> Uuid {
+        let user_id = Uuid::new_v4();
+        entities::User::ActiveModel {
+            id: Set(user_id),
+            username: Set("carol".into()),
+            description: Set(String::new()),
+            credential_policy: Set(serde_json::json!({})),
+            rate_limit_bytes_per_second: Set(None),
+            ldap_server_id: Set(None),
+            ldap_object_uuid: Set(None),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+
+        let cert_id = Uuid::new_v4();
+        entities::CertificateCredential::ActiveModel {
+            id: Set(cert_id),
+            user_id: Set(user_id),
+            label: Set("kubectl-dev".into()),
+            date_added: Set(None),
+            last_used: Set(None),
+            last_sso_at: Set(None),
+            certificate_pem: Set(
+                "-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----".into(),
+            ),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+
+        cert_id
+    }
+
+    #[tokio::test]
+    async fn unit_get_cert_last_sso_at_returns_none_when_never_stamped() {
+        let db = setup_db().await;
+        let cert_id = insert_user_and_cert(&*db.lock().await).await;
+
+        let got = get_cert_last_sso_at(&*db.lock().await, cert_id)
+            .await
+            .unwrap();
+        assert_eq!(got, None);
+    }
+
+    #[tokio::test]
+    async fn unit_get_cert_last_sso_at_returns_none_for_missing_row() {
+        // Mirrors the pubkey defensive case: a cert row vanishing between
+        // validation and freshness check must not error the auth flow — treat
+        // "missing" as "not fresh".
+        let db = setup_db().await;
+        let missing = Uuid::new_v4();
+
+        let got = get_cert_last_sso_at(&*db.lock().await, missing)
+            .await
+            .unwrap();
+        assert_eq!(got, None);
+    }
+
+    #[tokio::test]
+    async fn unit_update_cert_last_sso_at_roundtrip() {
+        let db = setup_db().await;
+        let cert_id = insert_user_and_cert(&*db.lock().await).await;
+
+        let now = OffsetDateTime::now_utc();
+        let rows_affected = update_cert_last_sso_at(&*db.lock().await, cert_id, now)
+            .await
+            .unwrap();
+        assert_eq!(rows_affected, 1, "expected exactly one row updated");
+
+        let got = get_cert_last_sso_at(&*db.lock().await, cert_id)
+            .await
+            .unwrap();
+
+        // Sub-second precision can get truncated by SQLite; compare at
+        // whole-second granularity, same as the pubkey roundtrip test.
+        let got = got.expect("expected Some(ts)");
+        assert_eq!(got.unix_timestamp(), now.unix_timestamp());
+    }
+
+    #[tokio::test]
+    async fn unit_update_cert_last_sso_at_missing_row_returns_zero() {
+        // Defensive mirror of the pubkey case: atomic UPDATE matches nothing
+        // when the cert row has been deleted mid-flight; we report zero rows
+        // affected instead of failing, so the auth path stays forgiving.
+        let db = setup_db().await;
+        let missing = Uuid::new_v4();
+        let now = OffsetDateTime::now_utc();
+
+        let rows_affected = update_cert_last_sso_at(&*db.lock().await, missing, now)
             .await
             .unwrap();
         assert_eq!(rows_affected, 0);

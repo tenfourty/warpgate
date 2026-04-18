@@ -69,6 +69,7 @@ mod m00058_analytics;
 // column migrations are not idempotent, and renaming would re-run them.
 mod m00040_credentials_public_key_user_id_index;
 mod m00041_credentials_public_key_last_sso_at;
+mod m00042_credentials_certificate_last_sso_at;
 
 pub(crate) mod helpers;
 
@@ -139,6 +140,7 @@ impl MigratorTrait for Migrator {
             // cove-patch migrations registered after upstream's — see mod block above.
             Box::new(m00040_credentials_public_key_user_id_index::Migration),
             Box::new(m00041_credentials_public_key_last_sso_at::Migration),
+            Box::new(m00042_credentials_certificate_last_sso_at::Migration),
         ]
     }
 }
