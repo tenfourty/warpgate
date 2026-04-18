@@ -4682,6 +4682,11 @@
             "type": "string",
             "format": "date-time"
           },
+          "last_sso_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Timestamp of the last step-up SSO refresh that stamped this credential.\n`None` if the credential has never been gated on a fresh SSO — either\nstep-up is disabled, the user hasn't reconnected since the feature\nshipped, or the feature is disabled globally."
+          },
           "fingerprint": {
             "type": "string"
           }
@@ -4736,6 +4741,11 @@
           "last_used": {
             "type": "string",
             "format": "date-time"
+          },
+          "last_sso_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Timestamp of the last step-up SSO refresh that stamped this credential.\n`None` if the credential has never been gated on a fresh SSO — either\nstep-up is disabled, the user hasn't reconnected since the feature\nshipped, or the feature is disabled globally."
           },
           "openssh_public_key": {
             "type": "string"
