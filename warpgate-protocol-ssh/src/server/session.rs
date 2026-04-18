@@ -14,18 +14,21 @@ use futures::{Future, FutureExt};
 use russh::keys::{PublicKey, PublicKeyBase64};
 use russh::{MethodKind, MethodSet, Sig};
 use termcolor::Color;
+use time::OffsetDateTime;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{broadcast, oneshot, Mutex};
 use tracing::*;
 use uuid::Uuid;
 use warpgate_common::auth::{
     AuthCredential, AuthResult, AuthSelector, AuthState, AuthStateUserInfo, CredentialKind,
+    CredentialMatch,
 };
 use warpgate_common::eventhub::{EventHub, EventSender, EventSubscription};
 use warpgate_common::{
     Secret, SessionId, SshHostKeyVerificationMode, Target, TargetOptions, TargetSSHOptions,
     WarpgateError,
 };
+use warpgate_core::auth::step_up::{get_pubkey_last_sso_at, is_fresh, update_pubkey_last_sso_at};
 use warpgate_core::recordings::{
     self, ConnectionRecorder, TerminalRecorder, TerminalRecordingStreamId, TrafficConnectionParams,
     TrafficRecorder,
@@ -1249,7 +1252,10 @@ impl ServerSession {
 
         // Built-in: WARPGATE_AUTHENTICATION_TYPE
         if let Some(ref auth_type) = self.authentication_type {
-            env_vars.push(("WARPGATE_AUTHENTICATION_TYPE".to_string(), auth_type.clone()));
+            env_vars.push((
+                "WARPGATE_AUTHENTICATION_TYPE".to_string(),
+                auth_type.clone(),
+            ));
         }
 
         // Custom env vars from target SSH config
@@ -1762,13 +1768,24 @@ impl ServerSession {
                 let mut state = state_arc.lock().await;
 
                 if let Some(credential) = credential {
-                    if cp
+                    if let Some(cred_match) = cp
                         .lock()
                         .await
                         .validate_credential(username, &credential)
                         .await?
-                        .is_some()
                     {
+                        // Record which pubkey row matched so the step-up
+                        // freshness gate below (and the stamp afterwards)
+                        // can address the exact credentials_public_key row.
+                        // Non-pubkey matches leave this unset — the gate
+                        // only fires on pubkey auth.
+                        if let CredentialMatch {
+                            kind: CredentialKind::PublicKey,
+                            credential_id: Some(pubkey_id),
+                        } = cred_match
+                        {
+                            state.set_matched_pubkey_id(pubkey_id);
+                        }
                         state.add_valid_credential(credential);
                     }
                 }
@@ -1777,11 +1794,63 @@ impl ServerSession {
 
                 match user_auth_result {
                     AuthResult::Accepted { user_info } => {
+                        // Snapshot everything we need out of AuthState and
+                        // drop the guard before acquiring config/db locks.
+                        // AuthState must remain the innermost lock in this
+                        // file — holding it across config.lock() + db.lock()
+                        // would reverse the ordering used elsewhere and risk
+                        // a future deadlock. Both extractions are cheap:
+                        // `matched_pubkey_id()` is Copy, and
+                        // `valid_credential_kinds()` clones a small HashSet.
+                        let matched_pubkey_id = state.matched_pubkey_id();
+                        let valid_kinds = state.valid_credential_kinds();
+                        let state_id = *state.id();
+                        drop(state);
+
+                        // Step-up freshness gate (per-pubkey). If the config
+                        // has `step_up_interval.ssh` set and a pubkey matched,
+                        // require a `WebUserApproval` handshake at most every
+                        // `interval`. A WebUserApproval already present in
+                        // valid_credentials (user just finished Okta in the
+                        // kbd-interactive loop) satisfies the gate and lets
+                        // us stamp `last_sso_at` below.
+                        //
+                        // Defensive: if pubkey matched but we don't have the
+                        // row id (`credential_id == None`, not expected
+                        // post-A0), treat the credential as stale so we
+                        // force a fresh handshake rather than silently pass.
+                        let step_up_ssh = {
+                            let cfg = self.services.config.lock().await;
+                            cfg.store.step_up_interval.as_ref().and_then(|s| s.ssh)
+                        };
+                        if let Some(interval) = step_up_ssh {
+                            let has_stepup = valid_kinds.contains(&CredentialKind::WebUserApproval);
+                            let pubkey_used = valid_kinds.contains(&CredentialKind::PublicKey);
+                            if pubkey_used && !has_stepup {
+                                let last = match matched_pubkey_id {
+                                    Some(pubkey_id) => {
+                                        let db = self.services.db.lock().await;
+                                        get_pubkey_last_sso_at(&db, pubkey_id).await?
+                                    }
+                                    None => None,
+                                };
+                                if !is_fresh(last, interval, OffsetDateTime::now_utc()) {
+                                    info!(
+                                        username = %user_info.username,
+                                        "SSH step-up required: pubkey last_sso_at is stale or missing"
+                                    );
+                                    return Ok(AuthResult::Need(
+                                        [CredentialKind::WebUserApproval].into_iter().collect(),
+                                    ));
+                                }
+                            }
+                        }
+
                         self.services
                             .auth_state_store
                             .lock()
                             .await
-                            .complete(state.id())
+                            .complete(&state_id)
                             .await;
                         let target_auth_result = {
                             self.services
@@ -1798,8 +1867,40 @@ impl ServerSession {
                             );
                             return Ok(AuthResult::Rejected);
                         }
-                        self._auth_accept(user_info.clone(), &resolved_target_name).await?;
+                        self._auth_accept(user_info.clone(), &resolved_target_name)
+                            .await?;
                         self.authentication_type = Some("user".to_string());
+
+                        // Stamp last_sso_at on the exact pubkey row only
+                        // when this accept was itself gated on a step-up —
+                        // i.e. WebUserApproval was presented alongside the
+                        // pubkey. Accepts that bypass the gate (step_up
+                        // disabled, or still within a fresh window) must
+                        // NOT refresh the clock, else the 12h window gets
+                        // silently extended on every reconnect and step-up
+                        // never actually fires.
+                        if step_up_ssh.is_some() {
+                            if let Some(pubkey_id) = matched_pubkey_id {
+                                if valid_kinds.contains(&CredentialKind::WebUserApproval) {
+                                    let db = self.services.db.lock().await;
+                                    if let Err(e) = update_pubkey_last_sso_at(
+                                        &db,
+                                        pubkey_id,
+                                        OffsetDateTime::now_utc(),
+                                    )
+                                    .await
+                                    {
+                                        warn!(
+                                            error = ?e,
+                                            %pubkey_id,
+                                            username = %user_info.username,
+                                            "Failed to stamp pubkey last_sso_at"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
                         Ok(AuthResult::Accepted { user_info })
                     }
                     x => Ok(x),
@@ -1895,6 +1996,7 @@ impl ServerSession {
         Ok(())
     }
 
+    #[allow(clippy::result_large_err)]
     fn send_command(&self, command: RCCommand) -> Result<(), RCCommand> {
         self.rc_tx.send((command, None)).map_err(|e| e.0 .0)
     }
