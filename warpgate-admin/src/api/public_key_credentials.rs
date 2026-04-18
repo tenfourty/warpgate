@@ -43,6 +43,11 @@ struct ExistingPublicKeyCredential {
     label: String,
     date_added: Option<OffsetDateTime>,
     last_used: Option<OffsetDateTime>,
+    /// Timestamp of the last step-up SSO refresh that stamped this credential.
+    /// `None` if the credential has never been gated on a fresh SSO — either
+    /// step-up is disabled, the user hasn't reconnected since the feature
+    /// shipped, or the feature is disabled globally.
+    last_sso_at: Option<OffsetDateTime>,
     openssh_public_key: String,
 }
 
@@ -58,6 +63,7 @@ impl From<PublicKeyCredential::Model> for ExistingPublicKeyCredential {
             id: credential.id,
             date_added: credential.date_added,
             last_used: credential.last_used,
+            last_sso_at: credential.last_sso_at,
             label: credential.label,
             openssh_public_key: credential.openssh_public_key,
         }
