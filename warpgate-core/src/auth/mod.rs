@@ -1,3 +1,5 @@
+pub mod step_up;
+
 use warpgate_common::WarpgateError;
 use warpgate_common::auth::{AuthCredential, AuthState};
 

@@ -391,6 +391,7 @@ impl Api {
             user_id: Set(user.id),
             date_added: Set(Some(OffsetDateTime::now_utc())),
             last_used: Set(None),
+            last_sso_at: Set(None),
             label: Set(body.label.clone()),
             openssh_public_key: Set(body.openssh_public_key.clone()),
         }
