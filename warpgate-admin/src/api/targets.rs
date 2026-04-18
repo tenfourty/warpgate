@@ -18,6 +18,38 @@ use warpgate_db_entities::{KnownHost, Role, Target, TargetRoleAssignment, Ticket
 use super::AdminContext;
 use crate::api::common::{case_insensitive_search, is_unique_violation};
 
+/// Returns true if any SSH target other than `exclude_target_id` has options
+/// whose `(host, port)` matches the given pair. Used when deleting an SSH
+/// target to decide whether the shared `known_hosts` entry is still needed.
+async fn other_ssh_targets_use_host_port(
+    db: &sea_orm::DatabaseConnection,
+    exclude_target_id: Uuid,
+    host: &str,
+    port: u16,
+) -> Result<bool, WarpgateError> {
+    let candidates = Target::Entity::find()
+        .filter(Target::Column::Kind.eq(TargetKind::Ssh))
+        .filter(Target::Column::Id.ne(exclude_target_id))
+        .all(db)
+        .await?;
+
+    for other in candidates {
+        let Ok(options) = serde_json::from_value::<TargetOptions>(other.options) else {
+            // Skip rows whose options fail to deserialize - they cannot
+            // meaningfully claim ownership of the known_hosts entry.
+            continue;
+        };
+        if let TargetOptions::Ssh(opts) = options
+            && opts.host == host
+            && opts.port == port
+        {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 /// Normalize, encrypt and serialize options
 fn serialize_options_for_storage(
     mut options: TargetOptions,
@@ -312,11 +344,25 @@ impl DetailApi {
             let options: TargetOptions = serde_json::from_value(target.options.clone())?;
             if let TargetOptions::Ssh(ssh_options) = options {
                 use warpgate_db_entities::KnownHost;
-                KnownHost::Entity::delete_many()
-                    .filter(KnownHost::Column::Host.eq(&ssh_options.host))
-                    .filter(KnownHost::Column::Port.eq(i32::from(ssh_options.port)))
-                    .exec(db)
-                    .await?;
+                // Only drop the known_hosts entry for (host, port) when no
+                // other SSH target references the same endpoint. Multiple
+                // targets frequently share a (host, port) pair, so eagerly
+                // deleting would wipe the host key cache for every sibling
+                // target, breaking subsequent auth.
+                if !other_ssh_targets_use_host_port(
+                    db,
+                    target.id,
+                    &ssh_options.host,
+                    ssh_options.port,
+                )
+                .await?
+                {
+                    KnownHost::Entity::delete_many()
+                        .filter(KnownHost::Column::Host.eq(&ssh_options.host))
+                        .filter(KnownHost::Column::Port.eq(i32::from(ssh_options.port)))
+                        .exec(db)
+                        .await?;
+                }
             }
         }
 
@@ -481,5 +527,171 @@ impl RolesApi {
         model.delete(db).await.map_err(WarpgateError::from)?;
 
         Ok(DeleteTargetRoleResponse::Deleted)
+    }
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod tests {
+    use sea_orm::Database;
+    use warpgate_common::{SSHTargetAuth, SshTargetPublicKeyAuth};
+    use warpgate_db_entities::Parameters::{ConfigMigrationValues, set_config_migration_values};
+    use warpgate_db_migrations::migrate_database;
+
+    use super::*;
+
+    async fn setup_db() -> sea_orm::DatabaseConnection {
+        set_config_migration_values(ConfigMigrationValues::default());
+        let conn = Database::connect("sqlite::memory:").await.unwrap();
+        migrate_database(&conn).await.unwrap();
+        conn
+    }
+
+    fn ssh_options(host: &str, port: u16) -> TargetOptions {
+        TargetOptions::Ssh(TargetSSHOptions {
+            host: host.to_string(),
+            port,
+            username: "user".into(),
+            allow_insecure_algos: None,
+            auth: SSHTargetAuth::PublicKey(SshTargetPublicKeyAuth::default()),
+            jump_host: None,
+            env: None,
+        })
+    }
+
+    async fn insert_ssh_target(
+        db: &sea_orm::DatabaseConnection,
+        name: &str,
+        host: &str,
+        port: u16,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        let options = ssh_options(host, port);
+        Target::ActiveModel {
+            id: Set(id),
+            name: Set(name.into()),
+            description: Set(String::new()),
+            kind: Set(TargetKind::Ssh),
+            options: Set(serde_json::to_value(options).unwrap()),
+            rate_limit_bytes_per_second: Set(None),
+            group_id: Set(None),
+            ticket_max_duration_seconds: Set(None),
+            ticket_requests_disabled: Set(false),
+            ticket_require_approval: Set(false),
+            ticket_max_uses: Set(None),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn insert_known_host(db: &sea_orm::DatabaseConnection, host: &str, port: u16) -> Uuid {
+        let id = Uuid::new_v4();
+        KnownHost::ActiveModel {
+            id: Set(id),
+            host: Set(host.into()),
+            port: Set(i32::from(port)),
+            key_type: Set("ssh-ed25519".into()),
+            key_base64: Set("AAAA".into()),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn unit_other_ssh_targets_use_host_port_detects_sibling() {
+        let db = setup_db().await;
+        let a = insert_ssh_target(&db, "a", "shared.example", 22).await;
+        let _b = insert_ssh_target(&db, "b", "shared.example", 22).await;
+
+        assert!(
+            other_ssh_targets_use_host_port(&db, a, "shared.example", 22)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn unit_other_ssh_targets_use_host_port_returns_false_when_alone() {
+        let db = setup_db().await;
+        let a = insert_ssh_target(&db, "a", "shared.example", 22).await;
+        // Unrelated target on a different endpoint must not be counted.
+        let _c = insert_ssh_target(&db, "c", "other.example", 22).await;
+
+        assert!(
+            !other_ssh_targets_use_host_port(&db, a, "shared.example", 22)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn unit_other_ssh_targets_use_host_port_distinguishes_port() {
+        let db = setup_db().await;
+        let a = insert_ssh_target(&db, "a", "shared.example", 22).await;
+        let _b = insert_ssh_target(&db, "b", "shared.example", 2222).await;
+
+        assert!(
+            !other_ssh_targets_use_host_port(&db, a, "shared.example", 22)
+                .await
+                .unwrap()
+        );
+    }
+
+    /// End-to-end check of the delete path's branch logic: when another SSH
+    /// target still references `(host, port)`, the shared known_hosts row
+    /// must survive the delete. This is the regression captured by the fix.
+    #[tokio::test]
+    async fn unit_delete_preserves_known_host_when_sibling_target_exists() {
+        let db = setup_db().await;
+        let a = insert_ssh_target(&db, "a", "shared.example", 22).await;
+        let _b = insert_ssh_target(&db, "b", "shared.example", 22).await;
+        let kh = insert_known_host(&db, "shared.example", 22).await;
+
+        // Simulate the branch inside api_delete_target: only delete
+        // known_hosts if no sibling references (host, port).
+        if !other_ssh_targets_use_host_port(&db, a, "shared.example", 22)
+            .await
+            .unwrap()
+        {
+            KnownHost::Entity::delete_many()
+                .filter(KnownHost::Column::Host.eq("shared.example"))
+                .filter(KnownHost::Column::Port.eq(22_i32))
+                .exec(&db)
+                .await
+                .unwrap();
+        }
+
+        let surviving = KnownHost::Entity::find_by_id(kh).one(&db).await.unwrap();
+        assert!(
+            surviving.is_some(),
+            "known_hosts row for shared.example:22 must survive because target B still uses it",
+        );
+    }
+
+    /// Complementary check: when the target being deleted is the last one
+    /// using `(host, port)`, the known_hosts row is removed as before.
+    #[tokio::test]
+    async fn unit_delete_removes_known_host_when_last_target() {
+        let db = setup_db().await;
+        let a = insert_ssh_target(&db, "a", "shared.example", 22).await;
+        let kh = insert_known_host(&db, "shared.example", 22).await;
+
+        if !other_ssh_targets_use_host_port(&db, a, "shared.example", 22)
+            .await
+            .unwrap()
+        {
+            KnownHost::Entity::delete_many()
+                .filter(KnownHost::Column::Host.eq("shared.example"))
+                .filter(KnownHost::Column::Port.eq(22_i32))
+                .exec(&db)
+                .await
+                .unwrap();
+        }
+
+        let remaining = KnownHost::Entity::find_by_id(kh).one(&db).await.unwrap();
+        assert!(remaining.is_none());
     }
 }
