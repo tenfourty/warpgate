@@ -68,6 +68,7 @@ mod m00058_analytics;
 // them, and a fresh DB applies them last. Do NOT renumber: the last_sso_at
 // column migrations are not idempotent, and renaming would re-run them.
 mod m00040_credentials_public_key_user_id_index;
+mod m00041_credentials_public_key_last_sso_at;
 
 pub(crate) mod helpers;
 
@@ -137,6 +138,7 @@ impl MigratorTrait for Migrator {
             Box::new(m00058_analytics::Migration),
             // cove-patch migrations registered after upstream's — see mod block above.
             Box::new(m00040_credentials_public_key_user_id_index::Migration),
+            Box::new(m00041_credentials_public_key_last_sso_at::Migration),
         ]
     }
 }

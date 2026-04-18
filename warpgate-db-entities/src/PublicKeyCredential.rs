@@ -15,6 +15,12 @@ pub struct Model {
     pub label: String,
     pub date_added: Option<OffsetDateTime>,
     pub last_used: Option<OffsetDateTime>,
+    /// Timestamp of the most recent successful step-up SSO (WebUserApproval)
+    /// authentication that used this specific pubkey row. Consulted by the
+    /// SSH step-up freshness gate to decide whether the next login must
+    /// force an Okta handshake. Stamped by
+    /// [`warpgate_core::auth::step_up::update_pubkey_last_sso_at`].
+    pub last_sso_at: Option<OffsetDateTime>,
     #[sea_orm(column_type = "Text")]
     pub openssh_public_key: String,
 }
