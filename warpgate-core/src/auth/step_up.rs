@@ -1,13 +1,18 @@
 //! Step-up SSO freshness helpers for per-credential periodic re-auth.
 //!
-//! The SSH pubkey auth handler consults these helpers to decide whether a
-//! given `credentials_public_key` row must force a `WebUserApproval` step-up
-//! before accepting the session. Freshness is evaluated per credential row so
-//! that e.g. pubkey A on laptop 1 and pubkey B on laptop 2 hold independent
-//! 12h clocks.
+//! Protocol handlers consult these helpers to decide whether a given
+//! credential row must force an SSO / `WebUserApproval` step-up before
+//! accepting the session. Freshness is evaluated per credential row so that
+//! e.g. pubkey A on laptop 1 and pubkey B on laptop 2 - or cert A on kubectl
+//! config 1 and cert B on config 2 - hold independent clocks.
 //!
-//! Scope here: SSH pubkey only. HTTP / Kubernetes live on separate rows or
-//! session claims and have their own helpers.
+//! Scope:
+//! - SSH pubkey helpers (`get_pubkey_last_sso_at` /
+//!   `update_pubkey_last_sso_at`) against `credentials_public_key`.
+//! - Kubernetes cert helpers (`get_cert_last_sso_at` /
+//!   `update_cert_last_sso_at`) against `credentials_certificate`.
+//! - HTTP sessions are stamped on the Poem session claim instead of a DB row
+//!   (see `warpgate-protocol-http::step_up`).
 use std::time::Duration;
 
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
@@ -85,6 +90,59 @@ pub async fn update_pubkey_last_sso_at(
         tracing::debug!(
             %pubkey_id,
             "update_pubkey_last_sso_at: row vanished between validate and stamp, no-op"
+        );
+    }
+    Ok(result.rows_affected)
+}
+
+/// Read the `last_sso_at` column for the given cert credential row.
+///
+/// Returns `Ok(None)` if the row exists but was never stamped, or if the row
+/// no longer exists (defensive - a missing row cannot be fresh).
+///
+/// Mirror of [`get_pubkey_last_sso_at`] against `credentials_certificate`,
+/// consumed by the Kubernetes per-cert step-up gate.
+pub async fn get_cert_last_sso_at(
+    db: &DatabaseConnection,
+    cert_id: Uuid,
+) -> Result<Option<OffsetDateTime>, WarpgateError> {
+    let Some(row) = entities::CertificateCredential::Entity::find_by_id(cert_id)
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    Ok(row.last_sso_at)
+}
+
+/// Stamp `last_sso_at` on the given cert credential row.
+///
+/// Idempotent and forward-only: later stamps always overwrite earlier ones.
+/// Uses a single atomic UPDATE ... WHERE id = ? - one round trip, safe
+/// against concurrent validate/stamp races. Returns the number of rows
+/// affected; if the row vanished between validate and stamp (operator deleted
+/// the cert) the UPDATE affects zero rows. That's logged at debug and treated
+/// as a benign no-op so the auth flow doesn't fail hard on a race.
+///
+/// Mirror of [`update_pubkey_last_sso_at`] against `credentials_certificate`.
+pub async fn update_cert_last_sso_at(
+    db: &DatabaseConnection,
+    cert_id: Uuid,
+    now: OffsetDateTime,
+) -> Result<u64, WarpgateError> {
+    let result = entities::CertificateCredential::Entity::update_many()
+        .set(entities::CertificateCredential::ActiveModel {
+            last_sso_at: Set(Some(now)),
+            ..Default::default()
+        })
+        .filter(entities::CertificateCredential::Column::Id.eq(cert_id))
+        .exec(db)
+        .await?;
+
+    if result.rows_affected == 0 {
+        tracing::debug!(
+            %cert_id,
+            "update_cert_last_sso_at: row vanished between validate and stamp, no-op"
         );
     }
     Ok(result.rows_affected)

@@ -15,6 +15,11 @@ pub struct Model {
     pub label: String,
     pub date_added: Option<OffsetDateTime>,
     pub last_used: Option<OffsetDateTime>,
+    /// Last time the cert owner completed a step-up SSO handshake. `None`
+    /// means never - per-cert step-up treats that as stale and forces a
+    /// fresh SSO. Column added by
+    /// `m00042_credentials_certificate_last_sso_at`.
+    pub last_sso_at: Option<OffsetDateTime>,
     #[sea_orm(column_type = "Text")]
     pub certificate_pem: String,
 }

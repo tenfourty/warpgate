@@ -140,6 +140,7 @@ impl ListApi {
             user_id: Set(*user_id),
             date_added: Set(Some(OffsetDateTime::now_utc())),
             last_used: Set(None),
+            last_sso_at: Set(None),
             label: Set(body.label.clone()),
             certificate_pem: Set(client_cert_pem.clone()),
         }

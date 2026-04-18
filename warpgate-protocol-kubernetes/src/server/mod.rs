@@ -20,6 +20,7 @@ use crate::server::handlers::handle_api_request;
 pub mod auth;
 mod client_certs;
 mod handlers;
+pub mod step_up;
 
 use client_certs::CertificateExtractorMiddleware;
 

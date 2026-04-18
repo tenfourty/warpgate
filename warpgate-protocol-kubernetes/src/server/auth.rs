@@ -13,7 +13,9 @@ use warpgate_aws::EksClusterInfo;
 use warpgate_ca::{deserialize_certificate, serialize_certificate_serial};
 use warpgate_common::auth::{AuthResult, AuthState, CredentialKind};
 use warpgate_common::{SessionId, TargetKubernetesOptions, TargetOptions, User};
+use warpgate_common_http::ext::construct_external_url;
 use warpgate_common_http::logging::get_client_ip_addr;
+use warpgate_core::auth::step_up::get_cert_last_sso_at;
 use warpgate_core::login_protection::FailedAttemptInfo;
 use warpgate_core::{
     AuthorizedIdentity, ConfigProvider, Services, TargetAuthorization, authorize_for_target,
@@ -22,6 +24,7 @@ use warpgate_core::{
 use warpgate_db_entities::{CertificateCredential, CertificateRevocation};
 
 use crate::server::client_certs::RequestCertificateExt;
+use crate::server::step_up::is_cert_step_up_stale;
 
 pub fn unauthorized() -> poem::Error {
     poem::Error::from_string(
@@ -320,7 +323,15 @@ async fn authenticate(req: &Request, services: &Services) -> poem::Result<Option
         debug!("Found client certificate from middleware, validating against database");
 
         match validate_client_certificate(&client_cert.der_bytes, services).await {
-            Ok(Some(user)) => return Ok(Some(user)),
+            Ok(Some(CertAuthMatch { user, cert_id })) => {
+                // Per-cert step-up freshness gate. If
+                // `step_up_interval.kubernetes` is set and the matched cert
+                // row's `last_sso_at` is stale or missing, reject with 401 +
+                // `WWW-Authenticate: SSO <url>` so kubectl operators know to
+                // re-SSO via the gateway web UI.
+                enforce_cert_step_up_gate(req, services, cert_id, &user).await?;
+                return Ok(Some(user));
+            }
             Ok(None) => debug!("Client certificate provided but not found in database"),
             // A rejected certificate returns `Ok(None)`; an `Err` is a fault in the
             // certificate store (DB) or an unparseable cert, not a credential
@@ -468,11 +479,21 @@ fn cert_is_currently_valid(not_before: SystemTime, not_after: SystemTime, now: S
     now >= not_before && now <= not_after
 }
 
+/// Result of a successful client-certificate validation: the authenticated
+/// user plus the `credentials_certificate.id` of the row that matched. The
+/// cert id is the per-row step-up freshness key - callers consult
+/// `credentials_certificate.last_sso_at` on that row to decide whether to
+/// gate the request behind a fresh SSO handshake.
+pub struct CertAuthMatch {
+    pub user: User,
+    pub cert_id: Uuid,
+}
+
 // Helper function to validate client certificate against database
 pub async fn validate_client_certificate(
     cert_der: &[u8],
     services: &Services,
-) -> anyhow::Result<Option<User>> {
+) -> anyhow::Result<Option<CertAuthMatch>> {
     // Convert DER to PEM format for comparison
     let cert_pem = der_to_pem(cert_der);
 
@@ -522,6 +543,8 @@ pub async fn validate_client_certificate(
                     "Client certificate validated for user"
                 );
 
+                let cert_id = cert_credential.id;
+
                 // Update last_used timestamp
                 let mut active_model: CertificateCredential::ActiveModel = cert_credential.into();
                 active_model.last_used = Set(Some(OffsetDateTime::now_utc()));
@@ -529,7 +552,10 @@ pub async fn validate_client_certificate(
                     warn!("Failed to update certificate last_used timestamp: {}", e);
                 }
 
-                return Ok(Some(User::try_from(user)?));
+                return Ok(Some(CertAuthMatch {
+                    user: User::try_from(user)?,
+                    cert_id,
+                }));
             }
         }
     }
@@ -552,6 +578,90 @@ fn der_to_pem(der_bytes: &[u8]) -> String {
         "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----",
         cert_lines.join("\n")
     )
+}
+
+/// Enforce the Kubernetes per-cert step-up SSO freshness gate.
+///
+/// If `step_up_interval.kubernetes` is unset: no-op (feature disabled).
+/// Otherwise, look up `credentials_certificate.last_sso_at` for the matched
+/// cert row; if stale (older than the interval, or `NULL`), return a poem
+/// 401 `UNAUTHORIZED` carrying a `WWW-Authenticate: SSO <url>` header so a
+/// kubectl operator running inside a browser-capable wrapper knows to
+/// re-SSO. kubectl itself has no OIDC return-path today - on 401 the user
+/// browses to the gateway, completes SSO, and the operator tooling (future)
+/// stamps `last_sso_at`.
+///
+/// Database read failures fail-closed (treated as stale): an internal error
+/// reading the freshness column must not silently grant access beyond the
+/// interval.
+async fn enforce_cert_step_up_gate(
+    req: &Request,
+    services: &Services,
+    cert_id: Uuid,
+    user: &User,
+) -> poem::Result<()> {
+    // Hot path: interval absent -> feature off -> skip DB read entirely.
+    let interval = {
+        let cfg = services.config.lock().await;
+        cfg.store
+            .step_up_interval
+            .as_ref()
+            .and_then(|s| s.kubernetes)
+    };
+    let Some(interval) = interval else {
+        return Ok(());
+    };
+
+    let last = match get_cert_last_sso_at(&services.db, cert_id).await {
+        Ok(ts) => ts,
+        Err(error) => {
+            // Fail-closed: a DB error reading the stamp must not let the
+            // request through. Treat as stale (None) so the freshness check
+            // below rejects.
+            warn!(
+                %error,
+                %cert_id,
+                username = %user.username,
+                "Kubernetes step-up: failed to read cert last_sso_at; failing closed (stale)"
+            );
+            None
+        }
+    };
+
+    if !is_cert_step_up_stale(last, Some(interval), OffsetDateTime::now_utc()) {
+        return Ok(());
+    }
+
+    info!(
+        %cert_id,
+        username = %user.username,
+        "Kubernetes step-up required: cert last_sso_at is stale or missing"
+    );
+
+    // Build the gateway login URL so kubectl operators have a target to
+    // re-SSO against. Fall back to a header without a URL if the external
+    // host isn't configured - still returns 401, just without a hint.
+    let sso_header_value = {
+        let config = services.config.lock().await;
+        match construct_external_url(Some(req), &config, None).await {
+            Ok(mut url) => {
+                url.set_path("@warpgate");
+                url.set_fragment(Some("/login"));
+                format!("SSO url=\"{url}\"")
+            }
+            Err(error) => {
+                warn!(%error, "Kubernetes step-up: external host not configured, omitting SSO URL from WWW-Authenticate");
+                "SSO".to_string()
+            }
+        }
+    };
+
+    Err(poem::Error::from_response(
+        poem::Response::builder()
+            .status(poem::http::StatusCode::UNAUTHORIZED)
+            .header(poem::http::header::WWW_AUTHENTICATE, sso_header_value)
+            .body("SSO step-up required: client certificate has not completed SSO recently enough. Re-authenticate via the Warpgate web UI."),
+    ))
 }
 
 fn normalize_certificate_pem(pem: &str) -> String {

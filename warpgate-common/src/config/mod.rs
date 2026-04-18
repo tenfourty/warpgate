@@ -884,7 +884,8 @@ impl Default for LogConfig {
 /// existing auth behaviour is unchanged. MySQL / Postgres fields are accepted
 /// for forward-compatibility with the shared YAML surface but currently
 /// no-op (password-only protocols have no SSO path upstream); they emit a
-/// warning at load time.
+/// warning at load time. The `kubernetes` field is implemented but one-way -
+/// see its own doc comment; it warns at load time too.
 #[derive(Debug, Deserialize, Serialize, Clone, Default, JsonSchema)]
 pub struct StepUpIntervalConfig {
     /// Per-pubkey step-up interval for SSH (`credentials_public_key.last_sso_at`).
@@ -898,6 +899,13 @@ pub struct StepUpIntervalConfig {
     pub http: Option<Duration>,
 
     /// Per-cert step-up interval for Kubernetes (`credentials_certificate.last_sso_at`).
+    ///
+    /// DANGER: the gate ships without its stamp site. Nothing in the running
+    /// server ever writes `credentials_certificate.last_sso_at`, so the stamp
+    /// stays `NULL`, every freshness check fails, and setting this field 401s
+    /// every certificate-authenticated Kubernetes client permanently - there is
+    /// no handshake that can clear it. Leave it unset unless you are prepared
+    /// to hand-stamp the column by SQL. A load-time warning says the same.
     #[serde(default, with = "humantime_serde")]
     #[schemars(with = "Option<String>")]
     pub kubernetes: Option<Duration>,
@@ -997,6 +1005,9 @@ impl WarpgateConfig {
         }
 
         if let Some(ref step_up) = self.store.step_up_interval {
+            if step_up.kubernetes.is_some() {
+                emit_config_warning("`step_up_interval.kubernetes` gates certificate auth but has no stamp site: nothing writes `credentials_certificate.last_sso_at`, so every certificate-authenticated Kubernetes request will be rejected until the column is stamped by hand.".to_owned());
+            }
             if step_up.mysql.is_some() {
                 emit_config_warning("`step_up_interval.mysql` is accepted but currently no-ops (MySQL is password-only upstream, no SSO path).".to_owned());
             }
