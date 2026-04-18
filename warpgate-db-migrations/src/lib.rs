@@ -43,6 +43,7 @@ mod m00038_fix_target_auth_tags;
 mod m00039_show_session_menu;
 mod m00040_credentials_public_key_user_id_index;
 mod m00041_credentials_public_key_last_sso_at;
+mod m00042_credentials_certificate_last_sso_at;
 
 pub struct Migrator;
 
@@ -91,6 +92,7 @@ impl MigratorTrait for Migrator {
             Box::new(m00039_show_session_menu::Migration),
             Box::new(m00040_credentials_public_key_user_id_index::Migration),
             Box::new(m00041_credentials_public_key_last_sso_at::Migration),
+            Box::new(m00042_credentials_certificate_last_sso_at::Migration),
         ]
     }
 }
