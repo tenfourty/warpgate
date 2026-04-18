@@ -1023,6 +1023,7 @@ mod tests {
             label: Set("test key".into()),
             date_added: Set(None),
             last_used: Set(None),
+            last_sso_at: Set(None),
             openssh_public_key: Set(openssh_public_key),
         }
         .insert(db)
@@ -1106,6 +1107,7 @@ mod tests {
             label: Set("duplicate".into()),
             date_added: Set(None),
             last_used: Set(None),
+            last_sso_at: Set(None),
             openssh_public_key: Set(openssh_public_key),
         }
         .insert(&db)

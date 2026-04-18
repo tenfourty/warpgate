@@ -92,6 +92,7 @@ mod m00079_unique_target_and_group_names;
 // Position in the `migrations()` vec is what orders execution, not the name, so
 // these are registered last and a fresh DB simply applies them at the end.
 mod m00040_credentials_public_key_user_id_index;
+mod m00041_credentials_public_key_last_sso_at;
 
 pub(crate) mod helpers;
 
@@ -182,6 +183,7 @@ impl MigratorTrait for Migrator {
             Box::new(m00079_unique_target_and_group_names::Migration),
             // cove-patch migrations registered after upstream's - see mod block above.
             Box::new(m00040_credentials_public_key_user_id_index::Migration),
+            Box::new(m00041_credentials_public_key_last_sso_at::Migration),
         ]
     }
 }

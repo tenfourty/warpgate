@@ -64,3 +64,6 @@ warpgate-sso = { path = "../warpgate-sso" }
 warpgate-tls = { path = "../warpgate-tls" }
 webpki = { version = "0.22", default-features = false }
 x509-parser = { version = "0.18.1", default-features = false }
+
+[dev-dependencies]
+serde_yaml = { version = "0.9", default-features = false }

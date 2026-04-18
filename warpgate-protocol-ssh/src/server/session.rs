@@ -14,6 +14,7 @@ use russh::keys::{PublicKey, PublicKeyBase64};
 use russh::server::ChannelOpenHandle;
 use russh::{ChannelId, ChannelOpenFailure, MethodKind, MethodSet, Sig};
 use termcolor::Color;
+use time::OffsetDateTime;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Mutex, broadcast, oneshot};
 use tracing::*;
@@ -26,6 +27,7 @@ use warpgate_common::eventhub::{EventHub, EventSender};
 use warpgate_common::helpers::username::username_eq_ci;
 use warpgate_common::{Secret, SessionId, TargetOptions, WarpgateError};
 use warpgate_common_http::ext::construct_external_url;
+use warpgate_core::auth::step_up::{get_pubkey_last_sso_at, is_fresh, update_pubkey_last_sso_at};
 use warpgate_core::auth::submit_credential;
 use warpgate_core::login_protection::FailedAttemptInfo;
 use warpgate_core::recordings::{self, TerminalRecorder, TrafficConnectionParams, TrafficRecorder};
@@ -2300,6 +2302,47 @@ impl ServerSession {
                             .login_protection
                             .clear_failed_attempts(&remote_ip, &user_info.username)
                             .await;
+
+                        // Step-up freshness gate (per-pubkey). If the config
+                        // has `step_up_interval.ssh` set and a pubkey matched,
+                        // require a `WebUserApproval` handshake at most every
+                        // `interval`. A WebUserApproval already present in
+                        // valid_credentials (user just finished the web
+                        // approval in the keyboard-interactive loop) satisfies
+                        // the gate and lets us stamp `last_sso_at` below.
+                        //
+                        // Defensive: if a pubkey matched but we don't have the
+                        // row id (`credential_id == None`), treat the
+                        // credential as stale so we force a fresh handshake
+                        // rather than silently pass.
+                        let matched_pubkey_id = state.matched_pubkey_id();
+                        let valid_kinds = state.valid_credential_kinds();
+                        let step_up_ssh = {
+                            let cfg = self.services.config.lock().await;
+                            cfg.store.step_up_interval.as_ref().and_then(|s| s.ssh)
+                        };
+                        if let Some(interval) = step_up_ssh {
+                            let has_stepup = valid_kinds.contains(&CredentialKind::WebUserApproval);
+                            let pubkey_used = valid_kinds.contains(&CredentialKind::PublicKey);
+                            if pubkey_used && !has_stepup {
+                                let last = match matched_pubkey_id {
+                                    Some(pubkey_id) => {
+                                        get_pubkey_last_sso_at(&self.services.db, pubkey_id).await?
+                                    }
+                                    None => None,
+                                };
+                                if !is_fresh(last, interval, OffsetDateTime::now_utc()) {
+                                    info!(
+                                        username = %user_info.username,
+                                        "SSH step-up required: pubkey last_sso_at is stale or missing"
+                                    );
+                                    return Ok(AuthResult::Need(
+                                        [CredentialKind::WebUserApproval].into_iter().collect(),
+                                    ));
+                                }
+                            }
+                        }
+
                         let authorization = if resolved_target_name.is_empty() {
                             None
                         } else {
@@ -2324,6 +2367,32 @@ impl ServerSession {
                         };
                         self._auth_accept(user_info.clone(), authorization).await?;
                         self.authentication_type = Some("user".to_string());
+
+                        // Stamp last_sso_at on the exact pubkey row only when
+                        // this accept was itself gated on a step-up - i.e.
+                        // WebUserApproval was presented alongside the pubkey.
+                        // Accepts that bypass the gate (step-up disabled, or
+                        // still within a fresh window) must NOT refresh the
+                        // clock, else the window gets silently extended on
+                        // every reconnect and step-up never actually fires.
+                        if step_up_ssh.is_some()
+                            && let Some(pubkey_id) = matched_pubkey_id
+                            && valid_kinds.contains(&CredentialKind::WebUserApproval)
+                            && let Err(error) = update_pubkey_last_sso_at(
+                                &self.services.db,
+                                pubkey_id,
+                                OffsetDateTime::now_utc(),
+                            )
+                            .await
+                        {
+                            warn!(
+                                %error,
+                                %pubkey_id,
+                                username = %user_info.username,
+                                "Failed to stamp pubkey last_sso_at"
+                            );
+                        }
+
                         Ok(AuthResult::Accepted { user_info })
                     }
                     x => Ok(x),
