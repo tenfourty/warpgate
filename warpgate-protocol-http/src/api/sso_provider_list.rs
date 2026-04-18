@@ -7,6 +7,7 @@ use poem_openapi::param::Query;
 use poem_openapi::payload::{Html, Json, Response};
 use poem_openapi::{ApiResponse, Enum, Object, OpenApi};
 use serde::Deserialize;
+use time::OffsetDateTime;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 use url::form_urlencoded;
@@ -22,6 +23,7 @@ use warpgate_core::auth::submit_credential;
 use warpgate_sso::{SsoClient, SsoInternalProviderConfig};
 
 use super::sso_provider_detail::{SSO_CONTEXT_SESSION_KEY, SsoContext};
+use crate::step_up::StepUpSessionExt;
 use crate::SsoLoginState;
 use crate::api::auth_scheme::AuthedSession;
 use crate::api::common::{emit_unknown_authentication_failed_event, logout};
@@ -367,6 +369,12 @@ impl Api {
 
         if let Ok(user_info) = outcome.into_accepted() {
             authorize_session(req, &ctx, user_info).await?;
+            // Stamp the HTTP per-session step-up clock. Only the SSO return
+            // path stamps: password / OTP logins are not SSO handshakes and
+            // must not refresh the clock, else a user who only ever logs in
+            // via password would never re-SSO and the step-up gate would
+            // silently become a no-op.
+            session.set_last_sso_at(OffsetDateTime::now_utc());
             state.emit_authenticated_event_once();
             drop(state);
             session.set_sso_login_state(SsoLoginState {

@@ -7,6 +7,7 @@ mod middleware;
 pub mod proxy;
 mod session;
 mod session_handle;
+mod step_up;
 
 use std::fmt::Debug;
 use std::sync::Arc;
