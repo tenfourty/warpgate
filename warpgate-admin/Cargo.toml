@@ -36,3 +36,9 @@ warpgate-ldap = { path = "../warpgate-ldap" }
 warpgate-protocol-ssh = { path = "../warpgate-protocol-ssh" }
 warpgate-protocol-kubernetes = { path = "../warpgate-protocol-kubernetes" }
 regex.workspace = true
+
+[dev-dependencies]
+warpgate-db-migrations = { path = "../warpgate-db-migrations" }
+
+[features]
+sqlite = ["sea-orm/sqlx-sqlite", "warpgate-db-migrations/sqlite"]
