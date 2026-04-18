@@ -730,6 +730,9 @@ impl WarpgateConfig {
             if step_up.postgres.is_some() {
                 warn!("`step_up_interval.postgres` is accepted but currently no-ops (Postgres is password-only upstream, no SSO path).");
             }
+            if step_up.kubernetes.is_some() {
+                warn!("`step_up_interval.kubernetes` is set but no stamp caller is wired yet — cert auth will fail closed after the first interval until last_sso_at is hand-stamped or a kubectl OIDC flow is added.");
+            }
         }
     }
 }
