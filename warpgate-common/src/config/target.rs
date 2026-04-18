@@ -180,7 +180,7 @@ impl TargetMySqlOptions {
     pub fn normalize(&mut self) {
         if let Some(password) = self.password.take() {
             self.auth = Some(DatabaseTargetAuth::Password(DatabaseTargetPasswordAuth {
-                password: password,
+                password,
             }));
         }
     }
@@ -229,7 +229,7 @@ impl TargetPostgresOptions {
     pub fn normalize(&mut self) {
         if let Some(password) = self.password.take() {
             self.auth = Some(DatabaseTargetAuth::Password(DatabaseTargetPasswordAuth {
-                password: password,
+                password,
             }));
         }
     }

@@ -44,6 +44,13 @@ pub struct AuthState {
     identification_string: String,
     last_result: Option<AuthResult>,
     state_change_signal: broadcast::Sender<AuthResult>,
+    /// Row id of the `credentials_public_key` entry that last matched a
+    /// presented pubkey, if any. Set by the SSH handler right after
+    /// `validate_credential` returns a pubkey `CredentialMatch`, read by
+    /// the step-up freshness gate to identify which row's `last_sso_at`
+    /// to consult (and later stamp). Independent per pubkey row — that's
+    /// the whole point of per-credential step-up.
+    matched_pubkey_id: Option<Uuid>,
 }
 
 fn generate_identification_string() -> String {
@@ -76,9 +83,48 @@ impl AuthState {
             identification_string: generate_identification_string(),
             last_result: None,
             state_change_signal,
+            matched_pubkey_id: None,
         };
         this.maybe_update_verification_state();
         this
+    }
+
+    /// The `credentials_public_key` row id that last matched a pubkey offer,
+    /// or `None` if no pubkey has been validated (or the caller is on a
+    /// non-pubkey path like password/OTP). Used by the SSH step-up gate.
+    #[must_use]
+    pub const fn matched_pubkey_id(&self) -> Option<Uuid> {
+        self.matched_pubkey_id
+    }
+
+    /// Stamp the credential row id of the most recent pubkey match. Called
+    /// by the SSH handler immediately after `validate_credential` returns
+    /// `Some(CredentialMatch { kind: PublicKey, credential_id: Some(..) })`.
+    ///
+    /// First-match wins: once set, subsequent calls are no-ops. This anchors
+    /// the step-up handshake to the pubkey that originally triggered it — if
+    /// a client offers pubkey A (triggering step-up), then pubkey B (also a
+    /// match), then completes Okta from A's challenge, we stamp `last_sso_at`
+    /// on A, not on whichever pubkey happened to be the most recent match.
+    /// The field is cleared when a fresh `AuthState` is constructed for a
+    /// new session (see [`AuthState::new`]); there is no in-place reset.
+    pub const fn set_matched_pubkey_id(&mut self, id: Uuid) {
+        if self.matched_pubkey_id.is_none() {
+            self.matched_pubkey_id = Some(id);
+        }
+    }
+
+    /// The set of credential kinds that have been validated so far during
+    /// this auth attempt. Used by the SSH step-up gate to tell whether the
+    /// current attempt already carries a fresh `WebUserApproval` credential
+    /// (i.e. the user just completed an Okta handshake) — in which case the
+    /// gate lets the attempt through and stamps `last_sso_at`.
+    #[must_use]
+    pub fn valid_credential_kinds(&self) -> HashSet<CredentialKind> {
+        self.valid_credentials
+            .iter()
+            .map(AuthCredential::kind)
+            .collect()
     }
 
     pub const fn id(&self) -> &Uuid {
@@ -166,5 +212,54 @@ impl AuthState {
         external_url.set_path("@warpgate");
         external_url.set_fragment(Some(&format!("/login/{}", self.id())));
         Ok(external_url)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::broadcast;
+
+    use super::*;
+    use crate::auth::policy::AnySingleCredentialPolicy;
+
+    fn make_state() -> AuthState {
+        let (tx, _rx) = broadcast::channel(1);
+        let policy = AnySingleCredentialPolicy {
+            supported_credential_types: HashSet::new(),
+        };
+        AuthState::new(
+            Uuid::new_v4(),
+            None,
+            AuthStateUserInfo {
+                id: Uuid::new_v4(),
+                username: "alice".into(),
+            },
+            "SSH".into(),
+            Box::new(policy),
+            tx,
+        )
+    }
+
+    #[test]
+    fn unit_set_matched_pubkey_id_first_match_wins() {
+        // Simulate: client offers pubkey A (triggers step-up), then pubkey B
+        // (also matches) within the same AuthState. The stamp anchor must
+        // stay pinned to A so subsequent SSO freshness bookkeeping credits
+        // the pubkey that actually drove the Okta handshake.
+        let mut state = make_state();
+        assert_eq!(state.matched_pubkey_id(), None);
+
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+
+        state.set_matched_pubkey_id(a);
+        assert_eq!(state.matched_pubkey_id(), Some(a));
+
+        state.set_matched_pubkey_id(b);
+        assert_eq!(
+            state.matched_pubkey_id(),
+            Some(a),
+            "second call must be a no-op (first-match wins)"
+        );
     }
 }
