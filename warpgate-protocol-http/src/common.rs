@@ -11,7 +11,9 @@ use poem::{Endpoint, EndpointExt, FromRequest, IntoResponse, Request, Response};
 use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
+use time::OffsetDateTime;
 use tokio::sync::Mutex;
+use tracing::info;
 use uuid::Uuid;
 use warpgate_common::auth::{AuthState, AuthStateUserInfo, CredentialKind};
 use warpgate_common::helpers::username::username_eq_ci;
@@ -26,6 +28,7 @@ use warpgate_db_entities::{User, UserAdminRoleAssignment};
 use warpgate_sso::WarpgateIdToken;
 
 use crate::session::SessionStore;
+use crate::step_up::{is_session_step_up_stale, StepUpSessionExt};
 
 pub const PROTOCOL_NAME: ProtocolName = "HTTP";
 static TARGET_SESSION_KEY: &str = "target_name";
@@ -57,6 +60,7 @@ pub trait SessionExt {
     fn set_target_name(&self, target_name: String);
     fn get_auth(&self) -> Option<SessionAuthorization>;
     fn set_auth(&self, auth: SessionAuthorization);
+    fn clear_auth(&self);
     fn get_auth_state_id(&self) -> Option<AuthStateId>;
     fn clear_auth_state(&self);
 
@@ -79,6 +83,10 @@ impl SessionExt for Session {
 
     fn set_auth(&self, auth: SessionAuthorization) {
         self.set(AUTH_SESSION_KEY, auth);
+    }
+
+    fn clear_auth(&self) {
+        self.remove(AUTH_SESSION_KEY);
     }
 
     fn get_auth_state_id(&self) -> Option<AuthStateId> {
@@ -145,8 +153,55 @@ pub async fn _inner_auth<E: Endpoint + 'static>(
     req: Request,
 ) -> poem::Result<Option<E::Output>> {
     let ctx = Option::<Data<&AuthenticatedRequestContext>>::from_request_without_body(&req).await?;
-    if ctx.is_none() {
+    let Some(ctx) = ctx else {
         return Ok(None);
+    };
+
+    // Per-session SSO step-up gate (spec A2). If the session is authed as a
+    // `User` (not a ticket, not an API token) and the configured HTTP
+    // interval has elapsed since the last SSO handshake on this session,
+    // forcibly re-auth: clear the session auth + stamp, then return `None`
+    // so that the surrounding `page_auth` / `endpoint_auth` wrapper redirects
+    // to the gateway login page (which single-provider SSO deployments
+    // auto-forward to the IdP). Tickets / tokens / anonymous fall through
+    // unchanged — we only pay the config-lock + session-read cost on the
+    // `User` path to keep the hot path cheap for token-authed traffic.
+    if let RequestAuthorization::Session(session_auth @ SessionAuthorization::User { .. }) =
+        &ctx.auth
+    {
+        // Pull the interval first; absent config → feature off, skip the
+        // session read entirely to keep the hot path cheap.
+        let interval = ctx
+            .services()
+            .config
+            .lock()
+            .await
+            .store
+            .step_up_interval
+            .as_ref()
+            .and_then(|s| s.http);
+        if interval.is_some() {
+            let session = <&Session>::from_request_without_body(&req).await?;
+            let last_sso_at = session.get_last_sso_at();
+            if is_session_step_up_stale(
+                Some(session_auth),
+                last_sso_at,
+                interval,
+                OffsetDateTime::now_utc(),
+            ) {
+                info!(
+                    username = %session_auth.username(),
+                    has_stamp = last_sso_at.is_some(),
+                    "HTTP step-up required: session last_sso_at is stale or missing"
+                );
+                // Drop just the auth claims + stamp; keep the rest of the
+                // session (e.g. SSO context set by `start_sso`) so the forced
+                // re-login can still complete its OAuth handshake.
+                session.clear_auth();
+                session.clear_last_sso_at();
+                return Ok(None);
+            }
+        }
     }
     return ep.call(req).await.map(Some);
 }
