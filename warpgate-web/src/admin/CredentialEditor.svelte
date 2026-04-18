@@ -24,6 +24,7 @@
     import Loadable from 'common/Loadable.svelte'
     import EmptyState from 'common/EmptyState.svelte'
     import Tooltip from 'common/sveltestrap-s5-ports/Tooltip.svelte'
+    import RelativeDate from './RelativeDate.svelte'
     import { adminPermissions } from './lib/store'
 
     interface Props {
@@ -344,6 +345,14 @@
                         {credential.label}
                     </div>
                     <small class="d-block text-muted">{abbreviatePublicKey(credential.opensshPublicKey)}</small>
+                    <small class="d-block text-muted">
+                        Last step-up SSO:
+                        {#if credential.lastSsoAt}
+                            <RelativeDate date={new Date(credential.lastSsoAt)} />
+                        {:else}
+                            never
+                        {/if}
+                    </small>
                 </div>
                 <CredentialUsedStateBadge credential={credential} />
             {/if}
@@ -354,6 +363,14 @@
                         {credential.label}
                     </div>
                     <small class="d-block text-muted abbreviate">SHA-256: <code>{credential.fingerprint}</code></small>
+                    <small class="d-block text-muted">
+                        Last step-up SSO:
+                        {#if credential.lastSsoAt}
+                            <RelativeDate date={new Date(credential.lastSsoAt)} />
+                        {:else}
+                            never
+                        {/if}
+                    </small>
                 </div>
                 <CredentialUsedStateBadge credential={credential} />
             {/if}
