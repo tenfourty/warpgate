@@ -349,6 +349,16 @@ impl AuthStateStore {
         state_arc: &Arc<Mutex<AuthState>>,
         grace: Duration,
     ) -> Result<bool, WarpgateError> {
+        // A step-up gate raises `Need(WebUserApproval)` to demand that *this
+        // credential* proves a fresh SSO handshake. Satisfying it from a
+        // remembered approval - which may belong to a different session
+        // entirely - would silently defeat the per-credential freshness
+        // guarantee the gate exists to provide, so step-up states opt out of
+        // the grace period and always require a real approval.
+        if state_arc.lock().await.is_step_up_pending() {
+            return Ok(false);
+        }
+
         let Some(key) = state_arc.lock().await.web_approval_match_key() else {
             return Ok(false);
         };
@@ -371,7 +381,12 @@ impl AuthStateStore {
             return Ok(false);
         }
 
-        state.add_web_user_approval();
+        // Marked as bypass-sourced: this approval was remembered from an
+        // earlier attempt (possibly a different session), so it is not
+        // evidence that *this* attempt did an SSO handshake. The SSH step-up
+        // gate keys off the marking to refuse it as step-up proof and to skip
+        // the `last_sso_at` stamp.
+        state.add_web_user_approval_via_grace_bypass();
         state.emit_web_approval_bypassed_event();
         Ok(true)
     }
@@ -416,6 +431,37 @@ mod tests {
                 )
             }
         }
+    }
+
+    /// A policy that is satisfied with no credentials at all - so `verify()`
+    /// is `Accepted` unless something else (a step-up gate) overrides it.
+    struct AlreadySatisfied;
+
+    impl CredentialPolicy for AlreadySatisfied {
+        fn is_sufficient(
+            &self,
+            _protocol: Protocol,
+            _valid_credentials: &[AuthCredential],
+        ) -> CredentialPolicyResponse {
+            CredentialPolicyResponse::Ok
+        }
+    }
+
+    /// An auth state with a known remote IP, so `web_approval_match_key()`
+    /// yields a key the approval cache can match on.
+    fn state_with(policy: Box<dyn CredentialPolicy + Send + Sync>) -> Arc<Mutex<AuthState>> {
+        Arc::new(Mutex::new(AuthState::new(
+            Uuid::new_v4(),
+            Some("10.0.0.5".parse().unwrap()),
+            AuthStateUserInfo {
+                id: Uuid::new_v4(),
+                username: "alice".into(),
+            },
+            Protocol::Ssh,
+            "target".into(),
+            policy,
+            broadcast::channel(8).0,
+        )))
     }
 
     fn interactive_state() -> Arc<Mutex<AuthState>> {
@@ -640,6 +686,146 @@ mod tests {
         assert!(ip_allowed(range.as_ref(), None));
         // No restriction configured.
         assert!(ip_allowed(None, Some("192.168.0.1".parse().unwrap())));
+    }
+
+    /// Security invariant (see the opt-out in `try_web_approval_bypass`): a
+    /// `Need(WebUserApproval)` raised by a *step-up* gate must never be
+    /// satisfied by the grace-period bypass, even when a recent approval
+    /// matches this attempt's key exactly. The gate's whole purpose is to
+    /// prove that *this* credential just did a fresh SSO handshake; a
+    /// remembered approval (possibly from a different session) is not that.
+    #[tokio::test]
+    async fn step_up_need_is_not_satisfiable_by_a_recent_approval() {
+        let mut store = AuthStateStore::new();
+        let grace = Duration::from_secs(3600);
+
+        let state = state_with(Box::new(AlreadySatisfied));
+        assert!(
+            matches!(state.lock().await.verify(), AuthResult::Accepted { .. }),
+            "baseline: the policy alone accepts"
+        );
+
+        state.lock().await.require_step_up();
+        assert!(
+            matches!(state.lock().await.verify(), AuthResult::Need(ref kinds)
+                if kinds.contains(&CredentialKind::WebUserApproval)),
+            "the step-up gate raises exactly the Need shape the bypass keys off"
+        );
+
+        // Record an approval matching this attempt's own key - the most
+        // permissive possible cache hit.
+        let key = state
+            .lock()
+            .await
+            .web_approval_match_key()
+            .expect("remote ip is set, so a key exists");
+        store.record_web_approval(key.clone());
+        assert!(
+            store.recent_approval_is_fresh(&key, grace),
+            "the cache entry is fresh, so only the opt-out can stop the bypass"
+        );
+
+        assert!(
+            !store.try_web_approval_bypass(&state, grace).await.unwrap(),
+            "a step-up Need must not be satisfied by a remembered approval"
+        );
+        assert!(
+            matches!(state.lock().await.verify(), AuthResult::Need(ref kinds)
+                if kinds.contains(&CredentialKind::WebUserApproval)),
+            "and the state must still be waiting for a real approval"
+        );
+
+        // Control: the same store and the same recorded approval DO bypass a
+        // policy-raised Need - proving the refusal above comes from the
+        // step-up opt-out, not from a key mismatch.
+        let policy_state = state_with(Box::new(RequireWebApproval));
+        assert_eq!(
+            policy_state.lock().await.web_approval_match_key().as_ref(),
+            Some(&key),
+            "the control state must produce the same approval key"
+        );
+        assert!(
+            store
+                .try_web_approval_bypass(&policy_state, grace)
+                .await
+                .unwrap(),
+            "a policy-raised Need is still bypassable within the grace period"
+        );
+    }
+
+    /// A `Need(WebUserApproval)` raised by the user's *credential policy* is
+    /// bypassable by design - but the approval the bypass injects must be
+    /// marked as such, because the SSH step-up gate reads the same
+    /// `valid_credentials` set. Without the marking the bypass makes
+    /// `has_stepup` true, skips the freshness gate, and re-stamps
+    /// `last_sso_at`, so chained reconnects inside the grace window slide the
+    /// step-up window forward forever with no SSO handshake at all.
+    ///
+    /// Consumed by `warpgate-protocol-ssh`'s `web_approval_proves_step_up`.
+    #[tokio::test]
+    async fn a_bypassed_approval_is_marked_so_step_up_cannot_count_or_stamp_it() {
+        let mut store = AuthStateStore::new();
+        let grace = Duration::from_secs(3600);
+
+        let state = state_with(Box::new(RequireWebApproval));
+        assert!(
+            !state.lock().await.web_approval_from_grace_bypass(),
+            "baseline: nothing has been bypassed yet"
+        );
+
+        let key = state
+            .lock()
+            .await
+            .web_approval_match_key()
+            .expect("remote ip is set, so a key exists");
+        store.record_web_approval(key.clone());
+
+        assert!(
+            store.try_web_approval_bypass(&state, grace).await.unwrap(),
+            "a policy-raised Need is bypassable within the grace period"
+        );
+
+        let state = state.lock().await;
+        assert!(
+            matches!(state.verify(), AuthResult::Accepted { .. }),
+            "the bypass does satisfy the policy"
+        );
+        assert!(
+            state
+                .valid_credential_kinds()
+                .contains(&CredentialKind::WebUserApproval),
+            "and the credential is present - which is exactly why the marking \
+             below is needed: the kind set alone cannot tell the two apart"
+        );
+        assert!(
+            state.web_approval_from_grace_bypass(),
+            "a bypass-injected approval must be marked, so the SSH step-up gate \
+             neither counts it as a handshake nor stamps last_sso_at from it"
+        );
+    }
+
+    /// A real approval landing after a bypass clears the marking: that one was
+    /// collected by this attempt, so it does prove a fresh handshake.
+    #[tokio::test]
+    async fn a_real_approval_clears_the_bypass_marking() {
+        let mut store = AuthStateStore::new();
+        let grace = Duration::from_secs(3600);
+
+        let state = state_with(Box::new(RequireWebApproval));
+        let key = state
+            .lock()
+            .await
+            .web_approval_match_key()
+            .expect("remote ip is set, so a key exists");
+        store.record_web_approval(key);
+        assert!(store.try_web_approval_bypass(&state, grace).await.unwrap());
+        assert!(state.lock().await.web_approval_from_grace_bypass());
+
+        state.lock().await.add_web_user_approval();
+        assert!(
+            !state.lock().await.web_approval_from_grace_bypass(),
+            "a human approving this attempt supersedes the remembered one"
+        );
     }
 
     fn approval_key(scope: WebApprovalScopeKey) -> WebApprovalMatchKey {

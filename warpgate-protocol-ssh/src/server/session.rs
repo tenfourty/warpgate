@@ -187,6 +187,24 @@ fn reject_with_allowed_auth_methods(allowed_auth_methods: MethodSet) -> russh::s
     }
 }
 
+/// Whether a `WebUserApproval` sitting in `valid_credentials` is evidence that
+/// *this* attempt just completed a step-up SSO handshake.
+///
+/// Two consumers, one question. The freshness gate skips its `last_sso_at` read
+/// when the answer is true, and the accept path stamps `last_sso_at` only when
+/// the answer is true.
+///
+/// An approval injected by the web-approval grace-period bypass answers false.
+/// It was granted for an earlier attempt - possibly a different session
+/// entirely - so counting it would both let the gate through without an SSO
+/// handshake and re-stamp the clock, and chained reconnects inside the grace
+/// window would slide the step-up window forward forever. A user whose
+/// `credential_policy.ssh` legitimately lists `WebUserApproval` reaches exactly
+/// that combination, because a policy-raised `Need` is bypassable by design.
+const fn web_approval_proves_step_up(approval_present: bool, approval_was_bypassed: bool) -> bool {
+    approval_present && !approval_was_bypassed
+}
+
 #[cfg(test)]
 mod tests {
     use russh::{MethodKind, MethodSet};
@@ -209,6 +227,28 @@ mod tests {
         assert_eq!(advertised_methods, configured_methods);
         assert!(!advertised_methods.contains(&MethodKind::Password));
         assert!(!advertised_methods.contains(&MethodKind::KeyboardInteractive));
+    }
+
+    /// The step-up gate and the `last_sso_at` stamp must both refuse an
+    /// approval that the grace-period bypass injected. Otherwise a user whose
+    /// credential policy lists `WebUserApproval` re-stamps `last_sso_at` on
+    /// every reconnect inside `web_approval_grace_period_seconds`, and the
+    /// step-up interval never fires again.
+    #[test]
+    fn a_bypassed_web_approval_neither_satisfies_step_up_nor_stamps_last_sso_at() {
+        // A real approval collected by this attempt: gate satisfied, stamp taken.
+        assert!(super::web_approval_proves_step_up(true, false));
+
+        // The same credential, injected by the grace-period bypass: neither.
+        assert!(
+            !super::web_approval_proves_step_up(true, true),
+            "a grace-period bypass must not count as a step-up handshake, or \
+             last_sso_at is re-stamped on every reconnect inside the window"
+        );
+
+        // No approval at all: the gate falls through to the freshness read.
+        assert!(!super::web_approval_proves_step_up(false, false));
+        assert!(!super::web_approval_proves_step_up(false, true));
     }
 }
 
@@ -2315,14 +2355,30 @@ impl ServerSession {
                         // row id (`credential_id == None`), treat the
                         // credential as stale so we force a fresh handshake
                         // rather than silently pass.
+                        //
+                        // Snapshot what the gate needs and drop the AuthState
+                        // guard before taking the config lock, so AuthState
+                        // stays the innermost lock in this module. Both reads
+                        // are cheap: `matched_pubkey_id()` is Copy and
+                        // `valid_credential_kinds()` clones a small HashSet.
                         let matched_pubkey_id = state.matched_pubkey_id();
                         let valid_kinds = state.valid_credential_kinds();
+                        // A `WebUserApproval` that the grace-period bypass
+                        // injected from a remembered approval is not proof that
+                        // this attempt did an SSO handshake, so it must not
+                        // satisfy the gate or move the clock below.
+                        let approval_was_bypassed = state.web_approval_from_grace_bypass();
+                        drop(state);
+
                         let step_up_ssh = {
                             let cfg = self.services.config.lock().await;
                             cfg.store.step_up_interval.as_ref().and_then(|s| s.ssh)
                         };
                         if let Some(interval) = step_up_ssh {
-                            let has_stepup = valid_kinds.contains(&CredentialKind::WebUserApproval);
+                            let has_stepup = web_approval_proves_step_up(
+                                valid_kinds.contains(&CredentialKind::WebUserApproval),
+                                approval_was_bypassed,
+                            );
                             let pubkey_used = valid_kinds.contains(&CredentialKind::PublicKey);
                             if pubkey_used && !has_stepup {
                                 let last = match matched_pubkey_id {
@@ -2336,12 +2392,25 @@ impl ServerSession {
                                         username = %user_info.username,
                                         "SSH step-up required: pubkey last_sso_at is stale or missing"
                                     );
+                                    // Flip the AuthState into step-up mode so
+                                    // verify() reports Need(WebUserApproval) to
+                                    // the browser approve page and to the
+                                    // auth_state_store pending-request query.
+                                    // Without this the UI sees Accepted, hides
+                                    // the Authorize button, the approve POST
+                                    // never fires, and SSH keyboard-interactive
+                                    // loops until the client errors out with
+                                    // "bad message during authentication".
+                                    state_arc.lock().await.require_step_up();
                                     return Ok(AuthResult::Need(
                                         [CredentialKind::WebUserApproval].into_iter().collect(),
                                     ));
                                 }
                             }
                         }
+
+                        // Re-acquire for the rest of the accept path.
+                        state = state_arc.lock().await;
 
                         let authorization = if resolved_target_name.is_empty() {
                             None
@@ -2375,9 +2444,17 @@ impl ServerSession {
                         // still within a fresh window) must NOT refresh the
                         // clock, else the window gets silently extended on
                         // every reconnect and step-up never actually fires.
+                        // That includes an approval injected by the web-approval
+                        // grace period: it was granted for an earlier attempt,
+                        // so stamping from it would let chained reconnects
+                        // inside the grace window slide the step-up window
+                        // forward forever with no SSO handshake at all.
                         if step_up_ssh.is_some()
+                            && web_approval_proves_step_up(
+                                valid_kinds.contains(&CredentialKind::WebUserApproval),
+                                approval_was_bypassed,
+                            )
                             && let Some(pubkey_id) = matched_pubkey_id
-                            && valid_kinds.contains(&CredentialKind::WebUserApproval)
                             && let Err(error) = update_pubkey_last_sso_at(
                                 &self.services.db,
                                 pubkey_id,
