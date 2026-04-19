@@ -56,6 +56,13 @@ pub struct AuthState {
     /// to consult (and later stamp). Independent per pubkey row — that's
     /// the whole point of per-credential step-up.
     matched_pubkey_id: Option<Uuid>,
+    /// True when the SSH step-up gate has decided the current credentials
+    /// are insufficient and a `WebUserApproval` must arrive before
+    /// `verify()` reports `Accepted`. Without this flag the browser's
+    /// `/api/auth/state/:id` poll would see `Accepted` (because the pubkey
+    /// already validated) and the UI would hide the Authorize button.
+    /// Cleared in `add_valid_credential` when a `WebUserApproval` lands.
+    pending_step_up: bool,
 }
 
 fn generate_identification_string() -> String {
@@ -92,9 +99,24 @@ impl AuthState {
             state_change_signal,
             authenticated_event_emitted: false,
             matched_pubkey_id: None,
+            pending_step_up: false,
         };
         this.maybe_update_verification_state();
         this
+    }
+
+    /// Mark this state as requiring a `WebUserApproval` step-up. The SSH
+    /// handler calls this when `step_up_interval.ssh` is set and the
+    /// matched pubkey's `last_sso_at` is stale. After this flag is set,
+    /// `verify()` reports `Need({WebUserApproval})` until one arrives —
+    /// which is what the browser approve UI and the auth_state_store's
+    /// pending-request listing both key off. Fires the state-change
+    /// signal so the SSE stream pushes the new status to listening UIs.
+    pub fn require_step_up(&mut self) {
+        if !self.pending_step_up {
+            self.pending_step_up = true;
+            self.maybe_update_verification_state();
+        }
     }
 
     /// The `credentials_public_key` row id that last matched a pubkey offer,
@@ -164,6 +186,11 @@ impl AuthState {
     }
 
     pub fn add_valid_credential(&mut self, credential: AuthCredential) {
+        if credential.kind() == CredentialKind::WebUserApproval {
+            // Step-up handshake just completed; let the normal policy
+            // verdict take over again.
+            self.pending_step_up = false;
+        }
         self.valid_credentials.push(credential);
         self.maybe_update_verification_state();
     }
@@ -247,6 +274,20 @@ impl AuthState {
         if self.force_rejected {
             return AuthResult::Rejected;
         }
+        if self.pending_step_up
+            && !self
+                .valid_credentials
+                .iter()
+                .any(|c| c.kind() == CredentialKind::WebUserApproval)
+        {
+            // A step-up gate has fired but no WebUserApproval has landed
+            // yet. Short-circuit the policy so the browser's approve page
+            // renders the Authorize button and the approve POST wakes the
+            // SSH session via auth_state_store::complete.
+            let mut need = HashSet::new();
+            need.insert(CredentialKind::WebUserApproval);
+            return AuthResult::Need(need);
+        }
         match self
             .policy
             .is_sufficient(&self.protocol, &self.valid_credentials[..])
@@ -326,6 +367,31 @@ mod tests {
             state.matched_pubkey_id(),
             Some(a),
             "second call must be a no-op (first-match wins)"
+        );
+    }
+
+    #[test]
+    fn unit_require_step_up_overrides_accepted_verdict() {
+        // Without the override, a pubkey-valid state verifies as Accepted
+        // and the browser approve page hides the Authorize button. With
+        // require_step_up() the verdict flips to Need(WebUserApproval)
+        // until one lands, which is the contract the approve flow relies
+        // on (browser renders button; POST approve triggers complete()).
+        let mut state = make_state();
+        state.add_valid_credential(AuthCredential::Password("p".to_string().into()));
+        assert!(matches!(state.verify(), AuthResult::Accepted { .. }));
+
+        state.require_step_up();
+        let needed = match state.verify() {
+            AuthResult::Need(kinds) => kinds,
+            other => panic!("expected Need, got {other:?}"),
+        };
+        assert!(needed.contains(&CredentialKind::WebUserApproval));
+
+        state.add_valid_credential(AuthCredential::WebUserApproval);
+        assert!(
+            matches!(state.verify(), AuthResult::Accepted { .. }),
+            "WebUserApproval must clear the step-up flag"
         );
     }
 }
