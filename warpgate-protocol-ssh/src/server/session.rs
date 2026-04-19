@@ -1839,6 +1839,24 @@ impl ServerSession {
                                         username = %user_info.username,
                                         "SSH step-up required: pubkey last_sso_at is stale or missing"
                                     );
+                                    // Flip the AuthState into step-up mode so
+                                    // verify() reports Need(WebUserApproval)
+                                    // to the browser approve page and the
+                                    // auth_state_store pending-request query.
+                                    // Without this the UI sees Accepted and
+                                    // hides the Authorize button, so the
+                                    // approve POST never fires and SSH
+                                    // kbd-interactive loops forever.
+                                    let state_arc = self
+                                        .services
+                                        .auth_state_store
+                                        .lock()
+                                        .await
+                                        .get(&state_id)
+                                        .context(
+                                            "auth state vanished during SSH step-up gate",
+                                        )?;
+                                    state_arc.lock().await.require_step_up();
                                     return Ok(AuthResult::Need(
                                         [CredentialKind::WebUserApproval].into_iter().collect(),
                                     ));
