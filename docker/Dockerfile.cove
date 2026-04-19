@@ -51,7 +51,7 @@ RUN npm run openapi:client:admin \
 # of the target cache mount so it ends up in the image filesystem rather
 # than evaporating with the mount.
 WORKDIR /opt/warpgate
-ARG CARGO_BUILD_JOBS
+ARG CARGO_BUILD_JOBS=default
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=warpgate-cargo-registry \
     --mount=type=cache,target=/usr/local/cargo/git,id=warpgate-cargo-git \
