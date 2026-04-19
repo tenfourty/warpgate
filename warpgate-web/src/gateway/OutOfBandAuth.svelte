@@ -22,13 +22,13 @@
     }
 
     async function approve () {
-        api.approveAuth({ id: params.stateId })
+        await api.approveAuth({ id: params.stateId })
         await reload()
         window.close()
     }
 
     async function reject () {
-        api.rejectAuth({ id: params.stateId })
+        await api.rejectAuth({ id: params.stateId })
         await reload()
         window.close()
     }
