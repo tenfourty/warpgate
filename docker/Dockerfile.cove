@@ -1,5 +1,20 @@
-# Cove-patched Warpgate build
-# Based on the official Dockerfile with our patches already applied in the source tree
+# syntax=docker/dockerfile:1.6
+# Cove-patched Warpgate build.
+#
+# Patches are already applied in the source tree (branch cove-patches). This
+# Dockerfile differs from upstream's in two ways that cut rebuild time on
+# iterative changes from ~20 minutes to ~3-5 minutes:
+#
+#   1. npm deps live in their own layer keyed on package-lock.json only, so a
+#      source edit does not bust `npm ci`.
+#   2. cargo registry / git / target dirs are BuildKit cache mounts, so
+#      `cargo build` only recompiles crates whose sources actually changed
+#      instead of starting from scratch every build.
+#
+# Build on memory-constrained hosts (e.g. baba, 12 GB) with
+#   --build-arg CARGO_BUILD_JOBS=2
+# to cap rustc parallelism. aws-sdk-ec2 alone peaks around 6-8 GB during
+# link with default all-cores parallelism and will OOM without this cap.
 FROM rust:1.85.0-bullseye AS build
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -10,20 +25,39 @@ RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
     && apt-get install -y --no-install-recommends ca-certificates-java nodejs openjdk-17-jdk \
     && rm -rf /var/lib/apt/lists/*
 
-COPY . /opt/warpgate
-
+# npm deps layer — invalidated only when package-lock.json changes.
+# --ignore-scripts skips the package.json postinstall (openapi client
+# generation) which needs source files not yet present in this layer.
+# The explicit `npm run openapi:client:*` steps below handle that after
+# the full source copy.
 WORKDIR /opt/warpgate/warpgate-web
+COPY warpgate-web/package.json warpgate-web/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm,id=warpgate-npm \
+    npm ci --ignore-scripts
 
-# Build frontend (match original Dockerfile: npm ci, openapi clients, vite build)
-RUN npm ci \
-    && npm run openapi:client:admin \
+# Full source copy — this layer is busted on any edit, but the npm and
+# cargo caches above/below are preserved.
+WORKDIR /opt/warpgate
+COPY . .
+
+# Frontend build. node_modules was populated in the deps layer and survives
+# the COPY above.
+WORKDIR /opt/warpgate/warpgate-web
+RUN npm run openapi:client:admin \
     && npm run openapi:client:gateway \
     && npm run build
 
+# Rust release build with persistent caches. The final binary is copied out
+# of the target cache mount so it ends up in the image filesystem rather
+# than evaporating with the mount.
 WORKDIR /opt/warpgate
-
-# Build Rust binary
-RUN cargo build --release
+ARG CARGO_BUILD_JOBS
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=warpgate-cargo-registry \
+    --mount=type=cache,target=/usr/local/cargo/git,id=warpgate-cargo-git \
+    --mount=type=cache,target=/opt/warpgate/target,id=warpgate-cargo-target \
+    cargo build --release \
+    && cp target/release/warpgate /warpgate
 
 FROM debian:bullseye-slim
 LABEL maintainer="cove-patched"
@@ -37,7 +71,7 @@ RUN apt-get -y update -qq \
 
 RUN adduser warpgate --disabled-password --gecos "" --uid ${USER_ID} --home /data --shell /usr/sbin/nologin
 
-COPY --from=build /opt/warpgate/target/release/warpgate /usr/local/bin/warpgate
+COPY --from=build /warpgate /usr/local/bin/warpgate
 
 VOLUME /data
 
