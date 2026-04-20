@@ -4,6 +4,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
 use std::time::Duration;
 
@@ -156,6 +157,7 @@ pub struct ServerSession {
     keyboard_interactive_state: Option<PendingKeyboardInteractiveAuth>,
     cached_successful_ticket_auth: Option<CachedSuccessfulTicketAuth>,
     allowed_auth_methods: MethodSet,
+    host_key_trust_prompt_active: Arc<AtomicBool>,
     /// Track the state of a client snooping around pre-auth
     probe: ProbeState,
 }
@@ -307,6 +309,7 @@ impl ServerSession {
             keyboard_interactive_state: None,
             cached_successful_ticket_auth: None,
             allowed_auth_methods: get_allowed_auth_methods(services).await?,
+            host_key_trust_prompt_active: Arc::new(AtomicBool::new(false)),
             probe: ProbeState::NoAttempt,
         };
 
@@ -1429,7 +1432,11 @@ impl ServerSession {
             .subscribe(|e| matches!(e, Event::ConsoleInput(_)))
             .await;
 
+        self.host_key_trust_prompt_active
+            .store(true, Ordering::SeqCst);
+
         let service_output = self.service_output.clone();
+        let prompt_active = self.host_key_trust_prompt_active.clone();
         tokio::spawn(async move {
             loop {
                 match sub.recv().await {
@@ -1446,6 +1453,7 @@ impl ServerSession {
                     _ => (),
                 }
             }
+            prompt_active.store(false, Ordering::SeqCst);
             service_output.show_progress();
         });
 
@@ -1833,6 +1841,16 @@ impl ServerSession {
                 .event_sender
                 .try_send_once(Event::ConsoleInput(data.clone()))
                 .await;
+
+            // While a host-key trust prompt is waiting for 'y'/'n', do not forward
+            // PTY input to the target channel. Otherwise the prompt-reply byte is
+            // queued on the target channel and replays into the shell once the
+            // target session opens. Note this runs ahead of the deliberate
+            // early-stdin forward below (#2065) — that path exists for exec/scp
+            // payloads, which never carry a PTY.
+            if self.host_key_trust_prompt_active.load(Ordering::SeqCst) {
+                return Ok(());
+            }
         }
 
         // While the target selection menu is open, keystrokes drive the menu
