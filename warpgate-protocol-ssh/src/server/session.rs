@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::Poll;
 
@@ -112,6 +113,7 @@ pub struct ServerSession {
     keyboard_interactive_state: KeyboardInteractiveState,
     cached_successful_ticket_auth: Option<CachedSuccessfulTicketAuth>,
     allowed_auth_methods: MethodSet,
+    host_key_trust_prompt_active: Arc<AtomicBool>,
 }
 
 fn session_debug_tag(id: &SessionId, remote_address: &SocketAddr) -> String {
@@ -172,6 +174,7 @@ impl ServerSession {
             keyboard_interactive_state: KeyboardInteractiveState::None,
             cached_successful_ticket_auth: None,
             allowed_auth_methods: get_allowed_auth_methods(services).await?,
+            host_key_trust_prompt_active: Arc::new(AtomicBool::new(false)),
         };
 
         let mut so_rx = this.service_output.subscribe();
@@ -985,7 +988,11 @@ impl ServerSession {
             .subscribe(|e| matches!(e, Event::ConsoleInput(_)))
             .await;
 
+        self.host_key_trust_prompt_active
+            .store(true, Ordering::SeqCst);
+
         let service_output = self.service_output.clone();
+        let prompt_active = self.host_key_trust_prompt_active.clone();
         tokio::spawn(async move {
             loop {
                 match sub.recv().await {
@@ -1002,6 +1009,7 @@ impl ServerSession {
                     _ => (),
                 }
             }
+            prompt_active.store(false, Ordering::SeqCst);
             service_output.show_progress();
         });
 
@@ -1348,6 +1356,17 @@ impl ServerSession {
                 .event_sender
                 .send_once(Event::ConsoleInput(data.clone()))
                 .await;
+
+            // While a host-key trust prompt is waiting for 'y'/'n', do not forward
+            // PTY input to the target channel. Otherwise the prompt-reply byte is
+            // queued on the target channel and replays into the shell once the
+            // target session opens.
+            if self
+                .host_key_trust_prompt_active
+                .load(Ordering::SeqCst)
+            {
+                return Ok(());
+            }
         }
 
         let _ = self.send_command(RCCommand::Channel(channel_id, ChannelOperation::Data(data)));
