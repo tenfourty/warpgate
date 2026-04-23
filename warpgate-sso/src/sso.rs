@@ -304,8 +304,32 @@ impl SsoClient {
         }
 
         // Extract raw ID token claims as JSON for custom claim lookup.
-        // This avoids serde(flatten) which could let malicious claims shadow typed fields.
-        let raw_id_token_claims = serde_json::to_value(claims).ok();
+        //
+        // We decode the raw JWT payload (the middle segment of the compact
+        // `header.payload.signature` form) rather than re-serializing the
+        // typed `IdTokenClaims<WarpgateClaims, ..>` struct. The typed
+        // round-trip silently drops any claim not declared on
+        // `WarpgateClaims` (serde's default behaviour for unknown fields),
+        // which would make custom `username_claim` lookups (e.g. Okta's
+        // `EXTRAUsername`) always return None.
+        //
+        // We deliberately do NOT add `#[serde(flatten)]` to `WarpgateClaims`
+        // because that would let a malicious OIDC provider shadow typed
+        // fields like `warpgate_roles` / `warpgate_admin_roles` via
+        // attacker-controlled claim names.
+        //
+        // Reading the raw payload is safe here: the full id_token signature
+        // was verified above at `id_token.claims(&token_verifier, nonce)?`,
+        // so the payload bytes are trusted. We only use this JSON for
+        // custom-claim *lookup by name* — the typed `claims` struct remains
+        // the sole source of truth for `warpgate_roles` etc.
+        let raw_id_token_claims = raw_claims_from_jwt(&id_token.to_string());
+        if raw_id_token_claims.is_none() && self.config.username_claim().is_some() {
+            tracing::warn!(
+                "Failed to decode raw ID token payload; custom username_claim lookup will \
+                 fall back to preferred_username",
+            );
+        }
 
         Ok(SsoResult {
             token: id_token.clone(),
@@ -328,11 +352,30 @@ impl SsoClient {
     }
 }
 
+/// Decode the payload segment of a compact-form JWS/JWT to a
+/// `serde_json::Value`, preserving every claim in the original token.
+///
+/// Input is the `header.payload.signature` compact form produced by
+/// `IdToken::to_string()`. Returns `None` on any structural / base64 / JSON
+/// decode failure — matching the prior `serde_json::to_value(...).ok()`
+/// semantics so call sites stay unchanged.
+///
+/// Callers MUST only invoke this on an id_token whose signature has already
+/// been verified (see `IdToken::claims(&verifier, nonce)`). We do not
+/// re-verify here.
+pub(crate) fn raw_claims_from_jwt(jwt: &str) -> Option<serde_json::Value> {
+    let payload_b64 = jwt.split('.').nth(1)?;
+    let payload_bytes = data_encoding::BASE64URL_NOPAD
+        .decode(payload_b64.as_bytes())
+        .ok()?;
+    serde_json::from_slice(&payload_bytes).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use super::{GroupClaim, flatten_group_claim};
+    use super::{GroupClaim, flatten_group_claim, raw_claims_from_jwt};
 
     fn flat(j: serde_json::Value) -> Vec<String> {
         flatten_group_claim(serde_json::from_value::<GroupClaim>(j).unwrap())
@@ -423,5 +466,49 @@ mod tests {
                 "val2".to_string(),
             ]
         );
+    }
+
+    /// Build a compact JWT (unsigned / dummy sig) for testing payload
+    /// extraction only.
+    fn make_jwt(payload_json: &str) -> String {
+        let header = data_encoding::BASE64URL_NOPAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload = data_encoding::BASE64URL_NOPAD.encode(payload_json.as_bytes());
+        let sig = data_encoding::BASE64URL_NOPAD.encode(b"not-a-real-signature");
+        format!("{header}.{payload}.{sig}")
+    }
+
+    #[test]
+    fn extracts_custom_username_claim() {
+        let jwt = make_jwt(
+            r#"{"sub":"s","CustomUsername":"alice","preferred_username":"alice@example.org"}"#,
+        );
+        let v = raw_claims_from_jwt(&jwt).expect("decode succeeds");
+        assert_eq!(v.get("CustomUsername").and_then(|v| v.as_str()), Some("alice"));
+        assert_eq!(
+            v.get("preferred_username").and_then(|v| v.as_str()),
+            Some("alice@example.org"),
+        );
+        assert_eq!(v.get("sub").and_then(|v| v.as_str()), Some("s"));
+    }
+
+    #[test]
+    fn preserves_arbitrary_unknown_claims() {
+        // Ensures we don't silently drop fields like the prior
+        // serde_json::to_value(typed_struct) round-trip did.
+        let jwt = make_jwt(r#"{"sub":"s","some_custom":"v","nested":{"a":1}}"#);
+        let v = raw_claims_from_jwt(&jwt).expect("decode succeeds");
+        assert_eq!(v.get("some_custom").and_then(|v| v.as_str()), Some("v"));
+        assert_eq!(v.get("nested").and_then(|n| n.get("a")).and_then(|v| v.as_i64()), Some(1));
+    }
+
+    #[test]
+    fn returns_none_on_malformed_input() {
+        assert!(raw_claims_from_jwt("").is_none());
+        assert!(raw_claims_from_jwt("notajwt").is_none());
+        // Valid structure but payload is not valid base64url:
+        assert!(raw_claims_from_jwt("aaa.!!!!.bbb").is_none());
+        // Valid base64url but not valid JSON:
+        let bad = data_encoding::BASE64URL_NOPAD.encode(b"not-json");
+        assert!(raw_claims_from_jwt(&format!("aaa.{bad}.bbb")).is_none());
     }
 }
