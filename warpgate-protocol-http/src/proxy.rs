@@ -491,21 +491,29 @@ async fn proxy_ws_inner(
             let (server_sink, server_source) = socket.split();
 
             if let Err(error) = {
-                let server_to_client =
-                    tokio::spawn(pump_websocket(server_source, client_sink, |msg| {
+                let server_to_client = tokio::spawn(pump_websocket(
+                    server_source,
+                    client_sink,
+                    |msg| {
                         Box::pin(async {
                             tracing::debug!("Server: {:?}", msg);
                             anyhow::Ok(msg)
                         })
-                    }));
+                    },
+                    "browser_to_backend",
+                ));
 
-                let client_to_server =
-                    tokio::spawn(pump_websocket(client_source, server_sink, |msg| {
+                let client_to_server = tokio::spawn(pump_websocket(
+                    client_source,
+                    server_sink,
+                    |msg| {
                         Box::pin(async {
                             tracing::debug!("Client: {:?}", msg);
                             anyhow::Ok(msg)
                         })
-                    }));
+                    },
+                    "backend_to_browser",
+                ));
 
                 server_to_client.await??;
                 client_to_server.await??;
