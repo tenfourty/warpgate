@@ -476,22 +476,29 @@ async fn _handle_websocket_request_inner(
         let (client_sink, client_source) = client_socket.split();
 
         let (server_sink, server_source) = socket.split();
-        let server_to_client = {
+        let mut server_to_client = {
             let recorder_tx = recorder_tx.clone();
-            tokio::spawn(pump_websocket(server_source, client_sink, move |msg| {
-                let recorder_tx = recorder_tx.clone();
-                async move {
-                    tracing::debug!("Server: {:?}", msg);
-                    if let tungstenite::Message::Binary(data) = &msg {
-                        let _ = recorder_tx.send(data.to_vec()).await;
+            tokio::spawn(pump_websocket(
+                server_source,
+                client_sink,
+                move |msg| {
+                    let recorder_tx = recorder_tx.clone();
+                    async move {
+                        tracing::debug!("Server: {:?}", msg);
+                        if let tungstenite::Message::Binary(data) = &msg {
+                            let _ = recorder_tx.send(data.to_vec()).await;
+                        }
+                        anyhow::Ok(msg)
                     }
-                    anyhow::Ok(msg)
-                }
-            }))
+                },
+                "k8s_browser_to_backend",
+            ))
         };
 
-        let client_to_server =
-            tokio::spawn(pump_websocket(client_source, server_sink, move |msg| {
+        let mut client_to_server = tokio::spawn(pump_websocket(
+            client_source,
+            server_sink,
+            move |msg| {
                 let recorder_tx = recorder_tx.clone();
                 async move {
                     tracing::debug!("Client: {:?}", msg);
@@ -500,10 +507,34 @@ async fn _handle_websocket_request_inner(
                     }
                     anyhow::Ok(msg)
                 }
-            }));
+            },
+            "k8s_backend_to_browser",
+        ));
 
-        server_to_client.await??;
-        client_to_server.await??;
+        // Whichever pump finishes first ends the session: abort the other and
+        // reap it, so the loser's half of the WebSocket is dropped rather than
+        // detached and left polling its peer.
+        let (server_finished, pump_result): (
+            bool,
+            Result<anyhow::Result<()>, tokio::task::JoinError>,
+        ) = tokio::select! {
+            result = &mut server_to_client => {
+                (true, result)
+            }
+            result = &mut client_to_server => {
+                (false, result)
+            }
+        };
+
+        if server_finished {
+            client_to_server.abort();
+            let _ = client_to_server.await;
+            pump_result.context("server-to-client WebSocket pump task failed")??;
+        } else {
+            server_to_client.abort();
+            let _ = server_to_client.await;
+            pump_result.context("client-to-server WebSocket pump task failed")??;
+        }
         debug!("Closing Websocket stream");
         Ok::<(), anyhow::Error>(())
     };

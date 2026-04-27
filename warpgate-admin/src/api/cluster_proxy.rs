@@ -463,8 +463,18 @@ async fn forward_websocket(
             let (peer_sink, peer_source) = peer.split();
             let (client_sink, client_source) = socket.split();
             let identity = |msg| Box::pin(async move { anyhow::Ok(msg) });
-            let mut to_client = tokio::spawn(pump_websocket(peer_source, client_sink, identity));
-            let mut to_peer = tokio::spawn(pump_websocket(client_source, peer_sink, identity));
+            let mut to_client = tokio::spawn(pump_websocket(
+                peer_source,
+                client_sink,
+                identity,
+                "cluster_peer_to_client",
+            ));
+            let mut to_peer = tokio::spawn(pump_websocket(
+                client_source,
+                peer_sink,
+                identity,
+                "cluster_client_to_peer",
+            ));
             tokio::select! {
                 _ = &mut to_client => to_peer.abort(),
                 _ = &mut to_peer => to_client.abort(),

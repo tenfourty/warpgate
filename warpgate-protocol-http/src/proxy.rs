@@ -550,21 +550,29 @@ async fn proxy_ws_inner(
             let (server_sink, server_source) = socket.split();
 
             if let Err(error) = {
-                let mut server_to_client =
-                    tokio::spawn(pump_websocket(server_source, client_sink, |msg| {
+                let mut server_to_client = tokio::spawn(pump_websocket(
+                    server_source,
+                    client_sink,
+                    |msg| {
                         Box::pin(async {
                             tracing::debug!("Server: {:?}", msg);
                             anyhow::Ok(msg)
                         })
-                    }));
+                    },
+                    "browser_to_backend",
+                ));
 
-                let mut client_to_server =
-                    tokio::spawn(pump_websocket(client_source, server_sink, |msg| {
+                let mut client_to_server = tokio::spawn(pump_websocket(
+                    client_source,
+                    server_sink,
+                    |msg| {
                         Box::pin(async {
                             tracing::debug!("Client: {:?}", msg);
                             anyhow::Ok(msg)
                         })
-                    }));
+                    },
+                    "backend_to_browser",
+                ));
 
                 let (server_finished, pump_result): (
                     bool,
