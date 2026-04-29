@@ -96,6 +96,28 @@ pub struct TargetHTTPOptions {
     pub external_host: Option<String>,
 }
 
+#[cfg(test)]
+mod public_flag_tests {
+    //! Per-VM-proxy P0: `public: bool` on `TargetHTTPOptions`. Default
+    //! `false` (private; existing behaviour) unless explicitly opted in.
+    //! `Object` derive auto-exposes the field through the OpenAPI schema.
+    use super::*;
+
+    #[test]
+    fn deserializes_public_default_false() {
+        let json = r#"{"url": "http://x:80"}"#;
+        let opts: TargetHTTPOptions = serde_json::from_str(json).unwrap();
+        assert!(!opts.public);
+    }
+
+    #[test]
+    fn deserializes_public_explicit_true() {
+        let json = r#"{"url": "http://x:80", "public": true}"#;
+        let opts: TargetHTTPOptions = serde_json::from_str(json).unwrap();
+        assert!(opts.public);
+    }
+}
+
 // `#[serde(default)]` sits on the container, not on each field, so that
 // `Default` is the single source for both an absent `tls` block and an absent
 // key inside a present one. Spelling the two separately is how `verify` came to
