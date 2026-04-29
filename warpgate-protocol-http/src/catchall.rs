@@ -65,6 +65,26 @@ pub async fn catchall_endpoint(
     })
 }
 
+/// True when the request path targets one of Warpgate's own management
+/// mounts (`/@warpgate*` or `/_warpgate*`).
+///
+/// Defence-in-depth on the public-target bypass: a misconfigured
+/// `public: true` target whose `external_host` matches Warpgate's base host
+/// must never be able to serve a management surface anonymously. At v0.28.6
+/// the two management prefixes are nested ahead of the catchall
+/// (`lib.rs:294-298`), so `page_auth` should not see these paths at all —
+/// this predicate keeps the guarantee independent of routing order.
+///
+/// Pure free function so the unit tests in `public_target_tests` can
+/// cover it directly without a real `Services` (same pattern as the
+/// other catchall helpers).
+pub(crate) fn is_warpgate_management_path(path: &str) -> bool {
+    path == "/@warpgate"
+        || path.starts_with("/@warpgate/")
+        || path == "/_warpgate"
+        || path.starts_with("/_warpgate/")
+}
+
 /// Outcome of consulting the public-target bypass on an incoming HTTP
 /// request. Pure decision over the resolved target options and the request
 /// authorization state — no async, no I/O — so it can be unit-tested
@@ -511,6 +531,60 @@ mod public_target_tests {
             find_http_target_by_external_host(&targets, "vm-1.example.com:3000").is_none(),
             "non-HTTP targets must be skipped by the HTTP catchall lookup",
         );
+    }
+
+    // ─── is_warpgate_management_path (defence-in-depth path guard) ──────
+
+    #[test]
+    fn warpgate_management_paths_are_guarded() {
+        // Defence-in-depth: even if an operator misconfigures a
+        // `public:true` target whose `external_host` matches Warpgate's
+        // own base host, the management surfaces (`/@warpgate`, including
+        // `/@warpgate/admin/*`) MUST NEVER be served anonymously by the
+        // public-target bypass. The HTML shell would otherwise leak.
+        for path in [
+            "/@warpgate",
+            "/@warpgate/",
+            "/@warpgate/admin",
+            "/@warpgate/admin/index.html",
+            "/@warpgate/api/openapi.json",
+        ] {
+            assert!(
+                super::is_warpgate_management_path(path),
+                "{path} must be classified as a Warpgate management path \
+                 and skip the public-target bypass",
+            );
+        }
+    }
+
+    #[test]
+    fn underscore_warpgate_alias_is_also_guarded() {
+        // `/_warpgate` is mounted alongside `/@warpgate` as an alternate
+        // prefix for environments where `@` is troublesome (e.g. some
+        // proxies). Treat it identically.
+        assert!(super::is_warpgate_management_path("/_warpgate"));
+        assert!(super::is_warpgate_management_path("/_warpgate/admin"));
+    }
+
+    #[test]
+    fn ordinary_paths_are_not_management_paths() {
+        // Any path that doesn't sit under the management mount points is
+        // eligible for the public-target bypass — webhook endpoints,
+        // proxied app routes, root, etc.
+        for path in [
+            "/",
+            "/webhooks/incoming",
+            "/api/v1/foo",
+            "/atwarpgate",            // similar prefix, must NOT match
+            "/some/@warpgate/nested", // segment elsewhere, must NOT match
+            "/_warp/something",       // similar prefix, must NOT match
+        ] {
+            assert!(
+                !super::is_warpgate_management_path(path),
+                "{path} must not be classified as a management path — \
+                 the bypass would never apply otherwise",
+            );
+        }
     }
 
     #[test]
