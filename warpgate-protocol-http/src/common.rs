@@ -25,6 +25,8 @@ use warpgate_core::ConfigProvider;
 use warpgate_db_entities::{User, UserAdminRoleAssignment};
 use warpgate_sso::WarpgateIdToken;
 
+use crate::catchall::{resolve_public_target_decision, PublicTargetDecision};
+
 use crate::session::SessionStore;
 
 pub const PROTOCOL_NAME: ProtocolName = "HTTP";
@@ -162,11 +164,98 @@ pub fn endpoint_auth<E: Endpoint + 'static>(e: E) -> impl Endpoint<Output = E::O
 
 pub fn page_auth<E: Endpoint + 'static>(e: E) -> impl Endpoint {
     e.around(|ep, req| async move {
+        // Per-VM-proxy P0 (M9): public-target bypass. If the request resolves
+        // to an HTTP target with `public: true`, anonymous and session-authed
+        // clients are routed through to the catchall without the normal
+        // session/role gate; admin/user API tokens hit a public target
+        // → 401 (tokens are admin-API-scoped). The lookup runs only on the
+        // catchall path because `page_auth` only wraps the catchall mount —
+        // the `/@warpgate` admin routes go through `endpoint_auth` instead
+        // (per `lib.rs` mounting).
+        match try_public_target_bypass(&req).await? {
+            PublicBypassOutcome::Bypass(synthetic_ctx) => {
+                // Override any pre-existing AuthenticatedRequestContext with
+                // the synthetic Ticket-style auth so the catchall's existing
+                // Ticket arm (need_role_auth = false, target_name from auth)
+                // routes the request to the resolved public target without
+                // running role checks. `_inner_auth`'s SSO step-up logic is
+                // gated on `Session(User { .. })` and so is also skipped.
+                return Ok(ep.data(synthetic_ctx).call(req).await?.into_response());
+            }
+            PublicBypassOutcome::Reject401 => {
+                return Err(poem::Error::from_string(
+                    "API tokens are not valid for public-target proxy access",
+                    StatusCode::UNAUTHORIZED,
+                ));
+            }
+            PublicBypassOutcome::NotApplicable => {}
+        }
+
         let err_resp = gateway_redirect(&req).into_response();
         Ok(_inner_auth(ep, req)
             .await?
             .map_or(err_resp, IntoResponse::into_response))
     })
+}
+
+/// Result of `try_public_target_bypass`. See [`page_auth`] for how each
+/// arm is handled. Kept private to this module because the synthetic
+/// `AuthenticatedRequestContext` carries internal-only auth claims.
+enum PublicBypassOutcome {
+    /// Public target resolved; route through with the synthetic Ticket
+    /// auth context so the catchall sees a target-scoped session.
+    Bypass(AuthenticatedRequestContext),
+    /// Public target resolved but the request carries an admin/user API
+    /// token — return 401.
+    Reject401,
+    /// No bypass applies; existing auth flow runs unchanged.
+    NotApplicable,
+}
+
+/// Inspect the request and decide whether the public-target bypass should
+/// fire. On `Bypass`, synthesises a `Ticket`-style `AuthenticatedRequestContext`
+/// pinned to the resolved target name so the catchall's existing Ticket arm
+/// proxies the request without role checks.
+///
+/// Synthetic auth uses `Uuid::nil()` and the username `"<public>"` —
+/// neither is reachable through any normal credential path, so the
+/// audit log surfaces the bypass rather than impersonating a real user.
+async fn try_public_target_bypass(req: &Request) -> poem::Result<PublicBypassOutcome> {
+    // UnauthenticatedRequestContext is attached globally by the
+    // `.data(...)` call in `lib.rs::run`, so this extraction never fails
+    // on the catchall route.
+    let unauth_ctx = Data::<&UnauthenticatedRequestContext>::from_request_without_body(req).await?;
+    let host = unauth_ctx.trusted_host_header(req);
+
+    // If `inject_request_authorization` already attached an
+    // `AuthenticatedRequestContext`, use its `auth` so the decision helper
+    // sees the real authorization state (admin/user tokens get rejected
+    // at the bypass instead of silently proxying).
+    let auth_ctx = Option::<Data<&AuthenticatedRequestContext>>::from_request_without_body(req)
+        .await
+        .ok()
+        .flatten();
+    let auth_ref = auth_ctx.as_deref().map(|c| &c.auth);
+
+    let (resolved, decision) =
+        resolve_public_target_decision(unauth_ctx.services(), host.as_deref(), auth_ref).await?;
+
+    match decision {
+        PublicTargetDecision::Bypass => {
+            let (target, _opts) =
+                resolved.expect("Bypass decision implies a resolved target");
+            let synthetic_auth = RequestAuthorization::Session(SessionAuthorization::Ticket {
+                user_id: Uuid::nil(),
+                username: "<public>".into(),
+                target_name: target.name.clone(),
+            });
+            Ok(PublicBypassOutcome::Bypass(
+                unauth_ctx.to_authenticated(synthetic_auth),
+            ))
+        }
+        PublicTargetDecision::Reject401 => Ok(PublicBypassOutcome::Reject401),
+        PublicTargetDecision::NotApplicable => Ok(PublicBypassOutcome::NotApplicable),
+    }
 }
 
 pub fn gateway_redirect(req: &Request) -> Response {
