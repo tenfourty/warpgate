@@ -100,7 +100,10 @@ async fn get_target_for_request(
     let session = <&Session>::from_request_without_body(req).await?;
     let params: QueryParams = req.params()?;
 
-    let request_host = ctx.trusted_hostname(req);
+    // Full Host header including `:port` — two HTTP targets may share a hostname
+    // and differ only by port (per-VM proxy), and `get_target_by_hostname` matches
+    // `external_host` verbatim.
+    let request_host = ctx.trusted_host_header(req);
 
     let host_based_target = if let Some(host) = request_host {
         let found = config_provider

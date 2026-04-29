@@ -102,6 +102,19 @@ mod tests {
     }
 
     #[test]
+    fn trusted_host_header_preserves_port() {
+        let req = Request::builder()
+            .uri_str("http://internal.example")
+            .header(HOST, "vm.example.com:3000")
+            .finish();
+
+        assert_eq!(
+            trusted_host_header(false, &req),
+            Some("vm.example.com:3000".to_string())
+        );
+    }
+
+    #[test]
     fn trusted_host_falls_back_when_forwarded_host_is_empty() {
         let req = trusted_header_request(Some(" , "), None);
 
