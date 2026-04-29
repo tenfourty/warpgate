@@ -87,6 +87,15 @@ pub struct TargetHTTPOptions {
 
     #[serde(default)]
     pub external_host: Option<String>,
+
+    /// Per-VM-proxy P0 (M9): when `true`, the catchall HTTP proxy serves
+    /// this target without requiring a Warpgate session. Anonymous and
+    /// session-authed clients pass through; admin/user API tokens hit a
+    /// public target → 401 (tokens are admin-API-scoped, not proxy-scoped).
+    /// Default `false` preserves existing behaviour; serde-default backfills
+    /// existing JSON-column rows so no DB migration is required.
+    #[serde(default)]
+    pub public: bool,
 }
 
 #[cfg(test)]
