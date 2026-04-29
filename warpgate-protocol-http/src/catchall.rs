@@ -60,6 +60,106 @@ pub async fn catchall_endpoint(
     })
 }
 
+/// Outcome of consulting the public-target bypass on an incoming HTTP
+/// request. Pure decision over the resolved target options and the request
+/// authorization state — no async, no I/O — so it can be unit-tested
+/// without spinning up a full `Services` fixture (per the T1 pattern of
+/// extracting `resolve_trusted_host_header` from `auth.rs`).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PublicTargetDecision {
+    /// `public: true` target with anonymous or session-authed client.
+    /// `page_auth` skips `_inner_auth` and the catchall proxies straight
+    /// through.
+    Bypass,
+    /// `public: true` target with admin or user API token. Tokens are
+    /// admin-REST-scoped only — proxy access via token is rejected with
+    /// 401 (per spec § 3.1, Q10).
+    Reject401,
+    /// Either no target matched the host, the matched target isn't HTTP,
+    /// or it has `public: false`. Existing auth path runs unchanged.
+    NotApplicable,
+}
+
+/// Decide how the public-target bypass should affect a request.
+///
+/// `target_opts` is the resolved HTTP target options (`None` means no host
+/// match or non-HTTP target). `auth` is the request's authorization state
+/// (`None` means anonymous — no `AuthenticatedRequestContext` was attached
+/// upstream by `inject_request_authorization`).
+///
+/// Pure free function so unit tests don't need a real `Services` —
+/// constructing `RequestAuthorization` and `TargetHTTPOptions` is enough.
+pub(crate) fn decide_public_target_access(
+    target_opts: Option<&TargetHTTPOptions>,
+    auth: Option<&RequestAuthorization>,
+) -> PublicTargetDecision {
+    let Some(opts) = target_opts else {
+        return PublicTargetDecision::NotApplicable;
+    };
+    if !opts.public {
+        return PublicTargetDecision::NotApplicable;
+    }
+    match auth {
+        // Anonymous (no auth context) and session-authed users bypass the
+        // role check and reach the proxy.
+        None | Some(RequestAuthorization::Session(_)) => PublicTargetDecision::Bypass,
+        // Admin/user API tokens are scoped to the admin REST API; using
+        // one against a public proxy target is a configuration error and
+        // returns 401 explicitly rather than silently proxying.
+        Some(RequestAuthorization::AdminToken)
+        | Some(RequestAuthorization::UserToken { .. }) => PublicTargetDecision::Reject401,
+    }
+}
+
+/// Look up an HTTP target whose `external_host` matches the given host
+/// header (port-aware, since T1's port-aware match key took effect).
+///
+/// Pure over `targets` so unit tests don't need a real config provider.
+/// The async caller is responsible for fetching the target list under
+/// the config-provider lock.
+pub(crate) fn find_http_target_by_external_host(
+    targets: &[Target],
+    host: &str,
+) -> Option<(Target, TargetHTTPOptions)> {
+    targets
+        .iter()
+        .filter_map(|t| match t.options {
+            TargetOptions::Http(ref options) => Some((t, options)),
+            _ => None,
+        })
+        .find(|(_, o)| o.external_host.as_deref() == Some(host))
+        .map(|(t, o)| (t.clone(), o.clone()))
+}
+
+/// Async wrapper around the host→target lookup + `decide_public_target_access`
+/// helpers. Used by `page_auth` (in `common.rs`) to skip the redirect-to-login
+/// when a request resolves to a public target.
+///
+/// `host` is the trusted Host header (already resolved by the caller via
+/// `UnauthenticatedRequestContext::trusted_host_header`, port-aware per T1)
+/// so this helper stays a thin async glue and the pure logic lives in the
+/// two helpers above. Returns the resolved target+options together with
+/// the bypass decision so the caller can either short-circuit (Bypass),
+/// reject (Reject401), or fall through to the existing auth path
+/// (NotApplicable).
+pub(crate) async fn resolve_public_target_decision(
+    services: &warpgate_core::Services,
+    host: Option<&str>,
+    auth: Option<&RequestAuthorization>,
+) -> poem::Result<(
+    Option<(Target, TargetHTTPOptions)>,
+    PublicTargetDecision,
+)> {
+    let Some(host) = host else {
+        return Ok((None, PublicTargetDecision::NotApplicable));
+    };
+    let targets = services.config_provider.lock().await.list_targets().await?;
+    let resolved = find_http_target_by_external_host(&targets, host);
+    let opts = resolved.as_ref().map(|(_, o)| o);
+    let decision = decide_public_target_access(opts, auth);
+    Ok((resolved, decision))
+}
+
 async fn get_target_for_request(
     req: &Request,
     ctx: &AuthenticatedRequestContext,
