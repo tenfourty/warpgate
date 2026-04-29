@@ -70,7 +70,7 @@ async fn get_target_for_request(
     let selected_target_name;
     let need_role_auth;
 
-    let request_host = ctx.trusted_hostname(req);
+    let request_host = ctx.trusted_host_header(req);
 
     let host_based_target_name = if let Some(host) = request_host {
         let found = ctx
