@@ -44,6 +44,7 @@
                         mode: TlsMode.Preferred,
                         verify: true,
                     },
+                    _public: false,
                 },
                 MySql: {
                     kind: TargetKind.MySql,

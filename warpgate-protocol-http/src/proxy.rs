@@ -683,6 +683,7 @@ mod tests {
             tls: Default::default(),
             headers: None,
             external_host: None,
+            public: false,
         }
     }
 
