@@ -1,11 +1,13 @@
 use std::ops::Deref;
 
 use poem::Request;
+use poem::http::header::HOST;
 use poem::http::uri::{Authority, Scheme};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use warpgate_common::http_headers::X_FORWARDED_HOST;
 
-use crate::request::{trusted_host_header, trusted_proto};
+use crate::request::trusted_proto;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AuthStateId(pub Uuid);
@@ -44,6 +46,43 @@ pub enum RequestAuthorization {
     Session(SessionAuthorization),
     UserToken { user_id: Uuid, username: String },
     AdminToken,
+}
+
+/// Resolves the trusted full `Host` header value (including `:port` if
+/// present), preferring `X-Forwarded-Host` when the caller has opted in via
+/// `should_trust_x_forwarded`.
+///
+/// Extracted as a free function so tests can exercise the logic without
+/// constructing a real [`warpgate_core::Services`]. The
+/// [`UnauthenticatedRequestContext::trusted_host_header`] method is a thin
+/// wrapper around this helper.
+fn resolve_trusted_host_header(req: &Request, should_trust_x_forwarded: bool) -> Option<String> {
+    let mut host = req.header(HOST).map(ToString::to_string).or_else(|| {
+        let uri = req.original_uri();
+        let h = uri.host()?;
+        Some(match uri.port() {
+            Some(port) => format!("{h}:{port}"),
+            None => h.to_string(),
+        })
+    });
+
+    if should_trust_x_forwarded {
+        if let Some(xfh) = req.header(&X_FORWARDED_HOST) {
+            host = Some(xfh.to_string());
+        }
+    }
+
+    host
+}
+
+/// Resolves the trusted hostname (port stripped), preferring
+/// `X-Forwarded-Host` when `should_trust_x_forwarded` is enabled.
+///
+/// Free-function counterpart to [`resolve_trusted_host_header`] — see that
+/// function's docs for why these helpers are extracted.
+fn resolve_trusted_hostname(req: &Request, should_trust_x_forwarded: bool) -> Option<String> {
+    resolve_trusted_host_header(req, should_trust_x_forwarded)
+        .map(|h| h.split(':').next().unwrap_or(&h).to_string())
 }
 
 #[derive(Clone)]
@@ -86,14 +125,13 @@ impl UnauthenticatedRequestContext {
     }
 
     pub fn trusted_host_header(&self, req: &Request) -> Option<String> {
-        trusted_host_header(self.should_trust_x_forwarded, req)
+        resolve_trusted_host_header(req, self.should_trust_x_forwarded)
     }
 
     /// Returns the trusted hostname only (port stripped),
     /// preferring X-Forwarded-Host if trust_x_forwarded_headers is enabled in config.
     pub fn trusted_hostname(&self, req: &Request) -> Option<String> {
-        let host_header = self.trusted_host_header(req)?;
-        Self::parse_host_authority(&host_header).map(|authority| authority.host().to_string())
+        resolve_trusted_hostname(req, self.should_trust_x_forwarded)
     }
 
     /// Returns the trusted port only,
