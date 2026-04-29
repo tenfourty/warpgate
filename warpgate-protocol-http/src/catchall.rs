@@ -170,3 +170,250 @@ async fn get_target_for_request(
 
     Ok(None)
 }
+
+#[cfg(test)]
+mod public_target_tests {
+    //! Per-VM-proxy P0 (M9): contract for the public-target bypass.
+    //!
+    //! These tests exercise the pure decision helpers
+    //! (`decide_public_target_access`, `find_http_target_by_external_host`)
+    //! directly, without spinning up a `Services` fixture — same pattern
+    //! as the T1 port-aware-match-key tests in
+    //! `warpgate-common-http/src/request.rs`, which cover the host-resolution
+    //! helper that feeds this gate.
+    //!
+    //! Contract under test:
+    //!   * Anonymous + public:true → Bypass (proxy through).
+    //!   * Session-authed + public:true → Bypass.
+    //!   * Admin/User token + public:true → Reject401 (admin-API-scoped).
+    //!   * public:false (default) → NotApplicable, regardless of auth.
+    //!     This is the additive-default guarantee.
+    //!   * No host match → NotApplicable.
+    //!   * Lookup is HTTP-only and port-aware (T1 contract).
+
+    use uuid::Uuid;
+    use warpgate_common::{Target, TargetHTTPOptions, TargetOptions, Tls};
+    use warpgate_common_http::{RequestAuthorization, SessionAuthorization};
+
+    use super::{
+        PublicTargetDecision, decide_public_target_access, find_http_target_by_external_host,
+    };
+
+    fn http_opts(public: bool, external_host: Option<&str>) -> TargetHTTPOptions {
+        TargetHTTPOptions {
+            url: "http://upstream:80".into(),
+            tls: Tls::default(),
+            headers: None,
+            external_host: external_host.map(str::to_string),
+            public,
+        }
+    }
+
+    fn target_with_options(name: &str, options: TargetOptions) -> Target {
+        Target {
+            id: Uuid::nil(),
+            name: name.into(),
+            description: String::new(),
+            allow_roles: vec![],
+            options,
+            rate_limit_bytes_per_second: None,
+            group_id: None,
+            ticket_max_duration_seconds: None,
+            ticket_requests_disabled: false,
+            ticket_require_approval: false,
+            ticket_max_uses: None,
+        }
+    }
+
+    fn http_target(name: &str, public: bool, external_host: Option<&str>) -> Target {
+        target_with_options(name, TargetOptions::Http(http_opts(public, external_host)))
+    }
+
+    fn user_token() -> RequestAuthorization {
+        RequestAuthorization::UserToken {
+            user_id: Uuid::nil(),
+            username: "alice".into(),
+        }
+    }
+
+    fn session_user() -> RequestAuthorization {
+        RequestAuthorization::Session(SessionAuthorization::User {
+            user_id: Uuid::nil(),
+            username: "alice".into(),
+        })
+    }
+
+    // ─── decide_public_target_access ──────────────────────────────────────
+
+    #[test]
+    fn anonymous_on_public_target_bypasses() {
+        let opts = http_opts(true, Some("vm.example.com:3000"));
+        assert_eq!(
+            decide_public_target_access(Some(&opts), None),
+            PublicTargetDecision::Bypass,
+            "anonymous request on public target must bypass auth — this is \
+             the whole point of public:true (webhook destinations). HMAC \
+             verification happens inside the VM.",
+        );
+    }
+
+    #[test]
+    fn session_user_on_public_target_bypasses() {
+        let opts = http_opts(true, Some("vm.example.com:3000"));
+        let auth = session_user();
+        assert_eq!(
+            decide_public_target_access(Some(&opts), Some(&auth)),
+            PublicTargetDecision::Bypass,
+            "session-authed user on public target also bypasses the role \
+             check so the toggle is consistent regardless of who's hitting it.",
+        );
+    }
+
+    #[test]
+    fn admin_token_on_public_target_rejected_401() {
+        let opts = http_opts(true, Some("vm.example.com:3000"));
+        let auth = RequestAuthorization::AdminToken;
+        assert_eq!(
+            decide_public_target_access(Some(&opts), Some(&auth)),
+            PublicTargetDecision::Reject401,
+            "admin tokens are admin-REST-API-scoped only; using one against \
+             a public proxy target must 401 explicitly per spec § 3.1 Q10, \
+             rather than silently proxying.",
+        );
+    }
+
+    #[test]
+    fn user_token_on_public_target_rejected_401() {
+        let opts = http_opts(true, Some("vm.example.com:3000"));
+        let auth = user_token();
+        assert_eq!(
+            decide_public_target_access(Some(&opts), Some(&auth)),
+            PublicTargetDecision::Reject401,
+            "user API tokens are also admin-REST-API-scoped — same reasoning \
+             as AdminToken; spec lists both as 401 cases.",
+        );
+    }
+
+    #[test]
+    fn cluster_token_on_public_target_rejected_401() {
+        // Upstream v0.28.x added a fourth `RequestAuthorization` arm for
+        // peer-to-peer cluster traffic. It is not proxy-scoped either, so it
+        // lands with the other token classes rather than silently bypassing.
+        let opts = http_opts(true, Some("vm.example.com:3000"));
+        let auth = RequestAuthorization::ClusterToken;
+        assert_eq!(
+            decide_public_target_access(Some(&opts), Some(&auth)),
+            PublicTargetDecision::Reject401,
+        );
+    }
+
+    #[test]
+    fn private_target_default_is_not_applicable() {
+        // The additive-default guarantee. With public:false (the serde
+        // default) the decision MUST be NotApplicable so the existing auth
+        // path runs unchanged byte-for-byte.
+        let opts = http_opts(false, Some("vm.example.com:3000"));
+        for auth in [
+            None,
+            Some(session_user()),
+            Some(user_token()),
+            Some(RequestAuthorization::AdminToken),
+        ] {
+            assert_eq!(
+                decide_public_target_access(Some(&opts), auth.as_ref()),
+                PublicTargetDecision::NotApplicable,
+                "public:false MUST never trigger the bypass — auth={auth:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn no_target_match_is_not_applicable() {
+        // Host header didn't resolve to any HTTP target; the existing flow
+        // (target_select_redirect / domain rebinding warnings) takes over.
+        for auth in [
+            None,
+            Some(session_user()),
+            Some(user_token()),
+            Some(RequestAuthorization::AdminToken),
+        ] {
+            assert_eq!(
+                decide_public_target_access(None, auth.as_ref()),
+                PublicTargetDecision::NotApplicable,
+            );
+        }
+    }
+
+    #[test]
+    fn session_ticket_on_public_target_also_bypasses() {
+        // Tickets are a kind of session auth; they're already scoped to a
+        // specific target row. They must not 401 against a public target —
+        // they're session-class auth.
+        let opts = http_opts(true, Some("vm.example.com:3000"));
+        let auth = RequestAuthorization::Session(SessionAuthorization::Ticket {
+            user_id: Uuid::nil(),
+            username: "alice".into(),
+            target_id: Uuid::nil(),
+        });
+        assert_eq!(
+            decide_public_target_access(Some(&opts), Some(&auth)),
+            PublicTargetDecision::Bypass,
+        );
+    }
+
+    // ─── find_http_target_by_external_host ────────────────────────────────
+
+    #[test]
+    fn finds_http_target_by_exact_host_with_port() {
+        // Locks in T1's port-aware-match-key contract: external_host
+        // including port must match the request host header verbatim.
+        let targets = vec![
+            http_target("vm-1-3000", true, Some("vm-1.example.com:3000")),
+            http_target("vm-1-8080", true, Some("vm-1.example.com:8080")),
+        ];
+        let (t, _) = find_http_target_by_external_host(&targets, "vm-1.example.com:3000")
+            .expect("must match the :3000 target, not :8080");
+        assert_eq!(t.name, "vm-1-3000");
+    }
+
+    #[test]
+    fn returns_none_when_no_target_matches() {
+        let targets = vec![http_target("vm-1", true, Some("vm-1.example.com:3000"))];
+        assert!(find_http_target_by_external_host(&targets, "other.example.com:3000").is_none());
+    }
+
+    #[test]
+    fn skips_non_http_targets() {
+        // The lookup is HTTP-only; a coincidental SSH target with a
+        // matching name must not be returned.
+        use warpgate_common::{SSHTargetAuth, TargetSSHOptions};
+        let ssh_target = target_with_options(
+            "ssh-collision",
+            TargetOptions::Ssh(TargetSSHOptions {
+                host: "vm-1.example.com".into(),
+                port: 22,
+                username: "root".into(),
+                allow_insecure_algos: None,
+                auth: SSHTargetAuth::default(),
+                jump_host: None,
+                env: None,
+            }),
+        );
+        let targets = vec![ssh_target];
+        assert!(
+            find_http_target_by_external_host(&targets, "vm-1.example.com:3000").is_none(),
+            "non-HTTP targets must be skipped by the HTTP catchall lookup",
+        );
+    }
+
+    #[test]
+    fn ignores_targets_with_no_external_host() {
+        let t = http_target("vm-1", true, None);
+        let targets = vec![t];
+        assert!(
+            find_http_target_by_external_host(&targets, "vm-1.example.com:3000").is_none(),
+            "targets with external_host=None must not match any host; the \
+             selectable-target redirect path handles those.",
+        );
+    }
+}
