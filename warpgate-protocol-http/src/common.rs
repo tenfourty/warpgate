@@ -27,7 +27,9 @@ use warpgate_core::ConfigProvider;
 use warpgate_db_entities::{User, UserAdminRoleAssignment};
 use warpgate_sso::WarpgateIdToken;
 
-use crate::catchall::{resolve_public_target_decision, PublicTargetDecision};
+use crate::catchall::{
+    is_warpgate_management_path, resolve_public_target_decision, PublicTargetDecision,
+};
 
 use crate::session::SessionStore;
 use crate::step_up::{is_session_step_up_stale, StepUpSessionExt};
@@ -276,6 +278,18 @@ enum PublicBypassOutcome {
 /// neither is reachable through any normal credential path, so the
 /// audit log surfaces the bypass rather than impersonating a real user.
 async fn try_public_target_bypass(req: &Request) -> poem::Result<PublicBypassOutcome> {
+    // Defence-in-depth: never bypass auth on Warpgate's own management
+    // surfaces. `page_auth` wraps both the catchall AND the admin static
+    // page mount (`lib.rs:193-196`); even if an operator mis-set
+    // `public: true` on a target with `external_host` matching the
+    // Warpgate base host, the `/@warpgate*` and `/_warpgate*` routes
+    // must not be served anonymously. The admin REST API stays
+    // protected by `endpoint_auth`, but this guard prevents the HTML
+    // shell from leaking via misconfiguration.
+    if is_warpgate_management_path(req.uri().path()) {
+        return Ok(PublicBypassOutcome::NotApplicable);
+    }
+
     // UnauthenticatedRequestContext is attached globally by the
     // `.data(...)` call in `lib.rs::run`, so this extraction never fails
     // on the catchall route.
