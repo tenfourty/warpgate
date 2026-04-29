@@ -149,3 +149,109 @@ impl RequestAuthorization {
 pub fn is_localhost_host(host: &str) -> bool {
     host == "localhost" || host == "127.0.0.1" || host.starts_with("127.")
 }
+
+#[cfg(test)]
+mod tests {
+    //! Regression guard for the per-VM-proxy port-aware target match key.
+    //!
+    //! `catchall.rs` in `warpgate-protocol-http` switched from
+    //! `trusted_hostname` to `trusted_host_header` so that two HTTP targets
+    //! whose `external_host` only differs by `:port` route distinctly. These
+    //! tests lock in the contract that the patch depends on:
+    //!
+    //!   * `trusted_host_header` returns the `Host` header verbatim
+    //!     (preserving any `:port`).
+    //!   * `trusted_hostname` strips the port.
+    //!   * `X-Forwarded-Host` is honoured only when `trust_x_forwarded` is on,
+    //!     and in that case the helper returns it verbatim too (port and all).
+    //!
+    //! These tests do not need a real `Services`, so they exercise the pure
+    //! free-function helpers `resolve_trusted_host_header` /
+    //! `resolve_trusted_hostname` directly. The `UnauthenticatedRequestContext`
+    //! methods are thin wrappers around these helpers.
+
+    use poem::Request;
+
+    use super::{resolve_trusted_host_header, resolve_trusted_hostname};
+
+    fn req_with_host(host: &str) -> Request {
+        Request::builder().header("Host", host).finish()
+    }
+
+    fn req_with_host_and_xfh(host: &str, xfh: &str) -> Request {
+        Request::builder()
+            .header("Host", host)
+            .header("X-Forwarded-Host", xfh)
+            .finish()
+    }
+
+    #[test]
+    fn trusted_host_header_preserves_port() {
+        let req = req_with_host("vm.cove.example.com:3000");
+        assert_eq!(
+            resolve_trusted_host_header(&req, false),
+            Some("vm.cove.example.com:3000".to_string()),
+            "trusted_host_header must keep :port so the catchall can match \
+             targets that only differ by external_host port",
+        );
+    }
+
+    #[test]
+    fn trusted_host_header_no_port_returns_bare_host() {
+        let req = req_with_host("vm.cove.example.com");
+        assert_eq!(
+            resolve_trusted_host_header(&req, false),
+            Some("vm.cove.example.com".to_string()),
+        );
+    }
+
+    #[test]
+    fn trusted_hostname_strips_port() {
+        let req = req_with_host("vm.cove.example.com:3000");
+        assert_eq!(
+            resolve_trusted_hostname(&req, false),
+            Some("vm.cove.example.com".to_string()),
+            "trusted_hostname must strip :port — cookie-domain and base-host \
+             validation rely on this and stay unchanged by the per-VM-proxy patch",
+        );
+    }
+
+    #[test]
+    fn header_and_hostname_diverge_when_port_present() {
+        // The whole point of the catchall.rs:73 swap: with a Host header that
+        // carries a port, the two helpers MUST return different strings, so
+        // that the catchall's `external_host == request_host` comparison can
+        // distinguish per-port targets.
+        let req = req_with_host("vm.cove.example.com:3000");
+        let with_port = resolve_trusted_host_header(&req, false);
+        let without_port = resolve_trusted_hostname(&req, false);
+        assert_ne!(
+            with_port, without_port,
+            "trusted_host_header and trusted_hostname must diverge for \
+             host-with-port; otherwise the per-VM-proxy match collides",
+        );
+    }
+
+    #[test]
+    fn xfh_ignored_when_trust_disabled() {
+        // Default proxy path: trust_x_forwarded_headers = false. The catchall
+        // operates here, so X-Forwarded-Host must NOT override Host.
+        let req = req_with_host_and_xfh("vm.cove.example.com:3000", "evil.example.com:9999");
+        assert_eq!(
+            resolve_trusted_host_header(&req, false),
+            Some("vm.cove.example.com:3000".to_string()),
+        );
+    }
+
+    #[test]
+    fn xfh_used_verbatim_when_trust_enabled() {
+        // When the operator opts in to trust_x_forwarded_headers (front-proxy
+        // deployments), the helper returns XFH verbatim — including any port —
+        // so per-VM-proxy routing still works behind a reverse proxy.
+        let req = req_with_host_and_xfh("front.example.com", "vm.cove.example.com:3000");
+        assert_eq!(
+            resolve_trusted_host_header(&req, true),
+            Some("vm.cove.example.com:3000".to_string()),
+        );
+    }
+}
