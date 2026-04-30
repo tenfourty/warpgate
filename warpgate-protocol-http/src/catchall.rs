@@ -210,7 +210,7 @@ async fn get_target_for_request(
 
         if found.is_some() {
             debug!(
-                "Domain rebinding detected: host={} -> target={:?}",
+                "Host header matched HTTP target: host={} -> target={:?}",
                 host, found
             );
         }
