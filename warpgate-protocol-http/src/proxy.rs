@@ -204,7 +204,7 @@ fn rewrite_response(
 
         if redirect_uri.authority() == target_uri.authority() {
             let old_value = value.clone();
-            *value = Uri::builder()
+            let mut rewritten = Uri::builder()
                 .path_and_query(
                     redirect_uri
                         .path_and_query()
@@ -212,8 +212,19 @@ fn rewrite_response(
                         .clone(),
                 )
                 .build()?
-                .to_string()
-                .parse()?;
+                .to_string();
+            // `http::Uri` has no fragment component, so `path_and_query()` above
+            // silently drops any `#fragment`. `url::Url` preserves it — re-append
+            // it so redirect targets like `/@warpgate#/login?next=<page>` survive
+            // the authority rewrite. Without this the fragment is lost and a
+            // hash-routed SPA login (Warpgate's own) never receives `next`, so
+            // after login the user lands on the bare gateway menu instead of the
+            // page they requested.
+            if let Some(fragment) = location.fragment() {
+                rewritten.push('#');
+                rewritten.push_str(fragment);
+            }
+            *value = rewritten.parse()?;
             debug!("Rewrote a redirect from {:?} to {:?}", old_value, value);
         }
     }
@@ -741,6 +752,31 @@ mod tests {
         assert_eq!(cookie.path(), Some("/"));
         assert_eq!(cookie.http_only(), Some(true));
         assert_eq!(cookie.secure(), Some(true));
+    }
+
+    #[test]
+    fn rewrite_response_preserves_redirect_fragment() {
+        // A hash-routed SPA login redirect (e.g. cove-web ->
+        // `/@warpgate#/login?next=<page>`) must keep its fragment through the
+        // authority rewrite; otherwise `next` is lost and post-login lands on
+        // the bare gateway menu instead of the requested page.
+        let mut resp = poem::Response::builder()
+            .status(http::StatusCode::FOUND)
+            .header(http::header::LOCATION, "/@warpgate#/login?next=%2Fvms")
+            .body(());
+
+        let options = make_options("http://100.0.0.1:8080");
+        let source_uri = Uri::try_from("http://100.0.0.1:8080/vms").unwrap();
+
+        rewrite_response(&mut resp, &options, &source_uri).unwrap();
+
+        let location = resp
+            .headers()
+            .get(http::header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(location, "/@warpgate#/login?next=%2Fvms");
     }
 
     fn rewrite_cookie(set_cookie: &str) -> Cookie<'static> {
