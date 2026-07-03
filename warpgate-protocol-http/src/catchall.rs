@@ -329,6 +329,10 @@ mod public_target_tests {
             options: TargetOptions::Http(http_opts(public, external_host)),
             rate_limit_bytes_per_second: None,
             group_id: None,
+            ticket_max_duration_seconds: None,
+            ticket_requests_disabled: false,
+            ticket_require_approval: false,
+            ticket_max_uses: None,
         }
     }
 
@@ -490,10 +494,15 @@ mod public_target_tests {
                 username: "root".into(),
                 allow_insecure_algos: None,
                 auth: SSHTargetAuth::default(),
+                jump_host: None,
                 env: None,
             }),
             rate_limit_bytes_per_second: None,
             group_id: None,
+            ticket_max_duration_seconds: None,
+            ticket_requests_disabled: false,
+            ticket_require_approval: false,
+            ticket_max_uses: None,
         };
         let targets = vec![ssh_target];
         assert!(
