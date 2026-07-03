@@ -119,7 +119,7 @@ fn make_redirect_url(err: &str) -> String {
 /// absolute URL names its own authority, so allowing one would let `?next=`
 /// carry the user to another site with a freshly authenticated session — the
 /// origin is decided by the SSO return URL, never by the caller.
-fn is_safe_redirect_target(next: &str) -> bool {
+pub(crate) fn is_safe_redirect_target(next: &str) -> bool {
     let Some(rest) = next.strip_prefix('/') else {
         return false;
     };

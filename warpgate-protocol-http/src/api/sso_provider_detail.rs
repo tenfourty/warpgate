@@ -1,8 +1,9 @@
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use poem::Request;
 use poem::session::Session;
 use poem::web::Data;
 use poem_openapi::param::{Path, Query};
-use poem_openapi::payload::Json;
+use poem_openapi::payload::{Json, Response};
 use poem_openapi::{ApiResponse, Object, OpenApi};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
@@ -11,7 +12,8 @@ use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::ext::construct_external_url;
 use warpgate_sso::{SsoClient, SsoLoginRequest, SsoReturnUrlDomainPreference};
 
-use crate::common::{host_is_subdomain_of_or_equal, is_localhost_host};
+use crate::api::sso_provider_list::is_safe_redirect_target;
+use crate::common::{host_is_subdomain_of_or_equal, is_localhost_host, should_auto_sso_redirect};
 
 pub struct Api;
 
@@ -31,6 +33,15 @@ enum StartSsoResponse {
     /// with `external_host` while `return_url_domain` is `external_host`
     #[oai(status = 400)]
     IncompatibleSsoDomain,
+}
+
+#[derive(ApiResponse)]
+enum AutoStartSsoResponse {
+    /// Browser redirect — either straight to the IdP authorize URL (auto-SSO
+    /// enabled, exactly one provider) or back to the gateway login SPA
+    /// (feature off, not exactly one provider, or `?login=password`).
+    #[oai(status = 302)]
+    Redirect,
 }
 
 pub static SSO_CONTEXT_SESSION_KEY: &str = "sso_request";
@@ -168,5 +179,122 @@ impl Api {
             StartSsoOutcome::NotFound => Ok(StartSsoResponse::NotFound),
             StartSsoOutcome::IncompatibleSsoDomain => Ok(StartSsoResponse::IncompatibleSsoDomain),
         }
+    }
+
+    /// Server-side auto-SSO entry point.
+    ///
+    /// A front door that gates its own traffic and rides a `public` HTTP target
+    /// (so Warpgate's own `page_auth` auto-redirect never sees the request)
+    /// redirects unauthenticated browser navigations here instead of straight
+    /// to the gateway login SPA. When the operator has opted into
+    /// single-provider auto-redirect, this 302s directly to the IdP authorize
+    /// URL — no SPA render, no button click. Otherwise (feature off, not
+    /// exactly one provider, a provider/host mismatch, or the
+    /// `?login=password` break-glass) it 302s to the normal gateway login page,
+    /// preserving `next`.
+    ///
+    /// Unauthenticated by design (mirrors `/sso/providers` + `/sso/*/start`):
+    /// it only ever *initiates* a login, and the resulting `next` is validated
+    /// against [`is_safe_redirect_target`] before use.
+    #[oai(
+        path = "/sso/auto-start",
+        method = "get",
+        operation_id = "auto_start_sso"
+    )]
+    async fn api_auto_start_sso(
+        &self,
+        req: &Request,
+        session: &Session,
+        ctx: Data<&UnauthenticatedRequestContext>,
+        next: Query<Option<String>>,
+        login: Query<Option<String>>,
+    ) -> Result<Response<AutoStartSsoResponse>, WarpgateError> {
+        // Drop an unsafe `next` (javascript:, //host, ...) rather than propagate
+        // it into either redirect target.
+        let next = next.0.filter(|n| is_safe_redirect_target(n));
+        let has_password_bypass = login.0.as_deref() == Some("password");
+
+        // Read the toggle + provider set, then decide. Mirrors
+        // `common::try_auto_sso_redirect`, but for the public-target front door.
+        let sole_provider = {
+            let enabled = ctx.parameters().await?.sso_auto_redirect;
+            let config = ctx.services().config.lock().await;
+            let providers = &config.store.sso_providers;
+            if should_auto_sso_redirect(
+                enabled,
+                providers.len(),
+                true,  // only reached as a top-level browser navigation
+                has_password_bypass,
+                false, // dedicated endpoint, not a management-path proxy hit
+            ) {
+                providers.first().map(|p| p.name.clone())
+            } else {
+                None
+            }
+        };
+
+        if let Some(provider_name) = sole_provider
+            && let StartSsoOutcome::Ok(url) =
+                start_sso_and_get_auth_url(req, session, ctx.0, &provider_name, next.clone()).await?
+        {
+            return Ok(Response::new(AutoStartSsoResponse::Redirect).header("Location", url));
+        }
+
+        // Fallback: gateway login SPA, preserving `next` and the break-glass.
+        let url = login_spa_fallback_url(next.as_deref(), has_password_bypass);
+        Ok(Response::new(AutoStartSsoResponse::Redirect).header("Location", url))
+    }
+}
+
+/// Build the gateway-login-SPA fallback URL for [`Api::api_auto_start_sso`],
+/// preserving `next` (percent-encoded) and re-emitting the `?login=password`
+/// break-glass. The re-emit is load-bearing: when auto-SSO is enabled with a
+/// single provider, the SPA's own on-load auto-start (`Login.svelte`) would
+/// otherwise immediately bounce the operator back to the IdP — so dropping the
+/// break-glass here silently neuters it. `#` fragment routing matches what
+/// `common::gateway_redirect` emits. Pure so the round-trip is unit-testable
+/// without a `Services` fixture.
+fn login_spa_fallback_url(next: Option<&str>, has_password_bypass: bool) -> String {
+    let mut url = match next {
+        Some(n) => format!(
+            "/@warpgate#/login?next={}",
+            utf8_percent_encode(n, NON_ALPHANUMERIC)
+        ),
+        None => "/@warpgate#/login".to_owned(),
+    };
+    if has_password_bypass {
+        url.push_str(if url.contains('?') {
+            "&login=password"
+        } else {
+            "?login=password"
+        });
+    }
+    url
+}
+
+#[cfg(test)]
+mod tests {
+    use super::login_spa_fallback_url;
+
+    #[test]
+    fn fallback_url_preserves_next_and_reemits_break_glass() {
+        // No break-glass: encoded next, no login param.
+        let u = login_spa_fallback_url(Some("/vms"), false);
+        assert_eq!(u, "/@warpgate#/login?next=%2Fvms");
+        assert!(!u.contains("login=password"));
+
+        // Break-glass with a next → appended as an extra query param.
+        let u = login_spa_fallback_url(Some("/vms"), true);
+        assert!(u.starts_with("/@warpgate#/login?next=%2Fvms"), "got: {u}");
+        assert!(u.ends_with("&login=password"), "got: {u}");
+
+        // Break-glass with no next → starts the query string.
+        assert_eq!(
+            login_spa_fallback_url(None, true),
+            "/@warpgate#/login?login=password"
+        );
+
+        // No next, no break-glass → bare login route.
+        assert_eq!(login_spa_fallback_url(None, false), "/@warpgate#/login");
     }
 }
