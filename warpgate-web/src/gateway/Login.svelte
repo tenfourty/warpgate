@@ -29,6 +29,12 @@
 
     const nextURL = new URLSearchParams(get(querystring)).get('next') ?? undefined
     const serverErrorMessage = new URLSearchParams(location.search).get('login_error')
+    // Break-glass: `?login=password` (in the hash query or the real query
+    // string) keeps the password form reachable even when single-provider
+    // auto-SSO is enabled. Mirrors the server-side `?login=password` bypass in
+    // warpgate-protocol-http (`request_has_password_bypass`).
+    const passwordBypass = new URLSearchParams(get(querystring)).get('login') === 'password'
+        || new URLSearchParams(location.search).get('login') === 'password'
     const initPromise = init()
 
     async function init () {
@@ -43,6 +49,31 @@
                 throw err
             }
         }
+
+        // Opt-in single-provider auto-SSO. On a fresh, un-errored
+        // login page with exactly one provider, start SSO immediately so the
+        // user never has to click the provider button. The server-side
+        // `/sso/auto-start` redirect normally means we never render here at
+        // all; this covers direct visits to the login SPA (bookmarks, other
+        // front doors). `?login=password` and a surfaced login error both
+        // suppress it so the form stays reachable.
+        if (authState === ApiAuthState.NotStarted && !passwordBypass && !serverErrorMessage) {
+            try {
+                if (!get(serverInfo)) {
+                    await reloadServerInfo()
+                }
+            } catch {
+                // Info fetch failed — fall through to the manual login UI.
+            }
+            if (get(serverInfo)?.ssoAutoRedirect) {
+                const providers = await ssoProvidersPromise
+                if (providers.length === 1) {
+                    startSSO(providers[0]!)
+                    return
+                }
+            }
+        }
+
         continueWithState()
     }
 
