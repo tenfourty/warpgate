@@ -1730,6 +1730,7 @@
         "required": [
           "ports",
           "password_login_mode",
+          "sso_auto_redirect",
           "minimize_password_login",
           "authorized_via_ticket",
           "authorized_via_sso_with_single_logout",
@@ -1763,6 +1764,9 @@
           },
           "password_login_mode": {
             "$ref": "#/components/schemas/PasswordLoginMode"
+          },
+          "sso_auto_redirect": {
+            "type": "boolean"
           },
           "minimize_password_login": {
             "type": "boolean",

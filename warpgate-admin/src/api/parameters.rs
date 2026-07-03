@@ -22,6 +22,7 @@ struct ParameterValues {
     pub ssh_client_auth_password: bool,
     pub ssh_client_auth_keyboard_interactive: bool,
     pub password_login_mode: Parameters::PasswordLoginMode,
+    pub sso_auto_redirect: bool,
     /// Deprecated in 0.26: superseded by `password_login_mode`
     pub minimize_password_login: bool,
     pub ticket_self_service_enabled: bool,
@@ -62,6 +63,7 @@ struct ParameterUpdate {
     pub ssh_client_auth_password: Option<bool>,
     pub ssh_client_auth_keyboard_interactive: Option<bool>,
     pub password_login_mode: Option<Parameters::PasswordLoginMode>,
+    pub sso_auto_redirect: Option<bool>,
     pub ticket_self_service_enabled: Option<bool>,
     pub ticket_auto_approve_existing_access: Option<bool>,
     pub ticket_max_duration_seconds: Option<Option<i64>>,
@@ -138,6 +140,7 @@ impl Api {
             ssh_client_auth_password: parameters.ssh_client_auth_password,
             ssh_client_auth_keyboard_interactive: parameters.ssh_client_auth_keyboard_interactive,
             password_login_mode: parameters.password_login_mode,
+            sso_auto_redirect: parameters.sso_auto_redirect,
             minimize_password_login: parameters.password_login_mode
                 == Parameters::PasswordLoginMode::Minimized,
             ticket_self_service_enabled: parameters.ticket_self_service_enabled,
@@ -220,6 +223,7 @@ impl Api {
             .ssh_client_auth_keyboard_interactive
             .map_or(NotSet, Set);
         parameters.password_login_mode = body.password_login_mode.map_or(NotSet, Set);
+        parameters.sso_auto_redirect = body.sso_auto_redirect.map_or(NotSet, Set);
         parameters.ticket_self_service_enabled =
             body.ticket_self_service_enabled.map_or(NotSet, Set);
         parameters.ticket_auto_approve_existing_access =
