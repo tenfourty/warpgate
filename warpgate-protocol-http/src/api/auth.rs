@@ -550,14 +550,30 @@ async fn serve_login(
                 )
                 .await;
             }
-            Ok(LoginResponse::Failure(Json(LoginFailureResponse {
-                // An invalid extra credential can leave the overall state
-                // `Accepted`; the attempt was still rejected, so it must
-                // report a failure rather than `Success` to the client.
-                state: match rejection.state {
+            // Enumeration hardening: only surface the specific
+            // next-factor state (SsoNeeded/OtpNeeded/...) when the presented
+            // credential actually validated - a legitimate multi-factor step
+            // reachable only by proving a real credential. An invalid
+            // credential or unknown user returns a generic `Failed` (matching
+            // the unknown-user branch above) so the response can't be used to
+            // distinguish whether an account exists or which auth method it
+            // uses. The SPA renders available methods from instance config
+            // (password_login_mode + SSO providers), not from this per-username
+            // response, so no UX is lost.
+            //
+            // An invalid extra credential can also leave the overall state
+            // `Accepted`; the attempt was still rejected, so it must report a
+            // failure rather than `Success` to the client.
+            let response_state = if rejection.credential_rejected {
+                ApiAuthState::Failed
+            } else {
+                match rejection.state {
                     AuthResult::Accepted { .. } => ApiAuthState::Failed,
                     other => other.into(),
-                },
+                }
+            };
+            Ok(LoginResponse::Failure(Json(LoginFailureResponse {
+                state: response_state,
                 credential_rejected: rejection.credential_rejected,
             })))
         }
@@ -587,10 +603,16 @@ async fn serve_otp_login(
         ))));
     }
 
+    // Enumeration hardening: an `AuthState` exists on this session as soon as
+    // the username resolved to a real user - `get_or_create_auth_state_for_request`
+    // creates it *before* the password is validated - so "no state" means
+    // "no such user" and would otherwise be a one-request existence oracle on
+    // this endpoint. Report the same opaque rejection the OTP arm below
+    // returns for a real account, so the two are indistinguishable.
     let Some(state_arc) = get_auth_state_for_request(req, ctx).await? else {
-        return Ok(LoginResponse::Failure(Json(LoginFailureResponse::state(
-            ApiAuthState::NotStarted,
-        ))));
+        return Ok(LoginResponse::Failure(Json(
+            LoginFailureResponse::credential_rejected(ApiAuthState::Failed),
+        )));
     };
 
     let mut state = state_arc.lock().await;
@@ -642,14 +664,25 @@ async fn serve_otp_login(
                 )
                 .await;
             }
-            Ok(LoginResponse::Failure(Json(LoginFailureResponse {
-                // An invalid extra credential can leave the overall state
-                // `Accepted`; the attempt was still rejected, so it must
-                // report a failure rather than `Success` to the client.
-                state: match rejection.state {
+            // Same enumeration hardening as the password arm: a rejected OTP
+            // must not surface the account's next-factor state, because that
+            // state exists only for a real account and so re-leaks both
+            // existence and the per-account factor set to anyone who submits a
+            // username with a dummy password and then posts any OTP.
+            //
+            // An invalid extra credential can also leave the overall state
+            // `Accepted`; the attempt was still rejected, so it must report a
+            // failure rather than `Success` to the client.
+            let response_state = if rejection.credential_rejected {
+                ApiAuthState::Failed
+            } else {
+                match rejection.state {
                     AuthResult::Accepted { .. } => ApiAuthState::Failed,
                     other => other.into(),
-                },
+                }
+            };
+            Ok(LoginResponse::Failure(Json(LoginFailureResponse {
+                state: response_state,
                 credential_rejected: rejection.credential_rejected,
             })))
         }
@@ -719,9 +752,9 @@ impl ReparseForwardedResponse for LoginResponse {
     async fn reparse_forwarded_response(response: poem::Response) -> poem::Result<Self> {
         match response.status() {
             http::StatusCode::CREATED => Ok(Self::Success),
-            http::StatusCode::UNAUTHORIZED => Ok(Self::Failure(Json(
-                parse_forwarded_body(response).await?,
-            ))),
+            http::StatusCode::UNAUTHORIZED => {
+                Ok(Self::Failure(Json(parse_forwarded_body(response).await?)))
+            }
             _ => Err(forwarded_error(response).await),
         }
     }
@@ -731,9 +764,7 @@ impl ReparseForwardedResponse for AuthStateResponse {
     async fn reparse_forwarded_response(response: poem::Response) -> poem::Result<Self> {
         match response.status() {
             http::StatusCode::NOT_FOUND => Ok(Self::NotFound),
-            http::StatusCode::OK => Ok(Self::Ok(Json(
-                parse_forwarded_body(response).await?,
-            ))),
+            http::StatusCode::OK => Ok(Self::Ok(Json(parse_forwarded_body(response).await?))),
             _ => Err(forwarded_error(response).await),
         }
     }

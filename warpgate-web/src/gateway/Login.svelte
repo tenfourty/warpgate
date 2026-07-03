@@ -117,8 +117,9 @@
     async function _login() {
         error = null
         credentialRejected = false
+        const submittingOtp = authState === ApiAuthState.OtpNeeded
         try {
-            if (authState === ApiAuthState.OtpNeeded) {
+            if (submittingOtp) {
                 await api.otpLogin({
                     otpLoginRequest: {
                         otp,
@@ -142,6 +143,17 @@
                     )
                     authState = failure.state
                     credentialRejected = failure.credentialRejected ?? false
+
+                    // A rejected OTP deliberately comes back as the opaque
+                    // `Failed` shape, identical to what an unknown account
+                    // gets, so the endpoint can't be used to test whether an
+                    // account exists. The OTP step is therefore tracked here
+                    // rather than read back off the response, so a mistyped
+                    // code leaves the user on the OTP field instead of
+                    // bouncing them back to the password form.
+                    if (submittingOtp && authState === ApiAuthState.Failed) {
+                        authState = ApiAuthState.OtpNeeded
+                    }
 
                     // Don't auto-advance to another auth method (e.g. SSO) when
                     // the submitted credential was rejected — show the error and
