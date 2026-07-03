@@ -70,6 +70,10 @@ mod m00058_analytics;
 mod m00040_credentials_public_key_user_id_index;
 mod m00041_credentials_public_key_last_sso_at;
 mod m00042_credentials_certificate_last_sso_at;
+// cove-patch: opt-in auto-redirect to the sole SSO provider. Numbered
+// above upstream's max (m00058) so it sorts last; registered after the cove
+// credential migrations so it applies last on both live and fresh DBs.
+mod m00059_sso_auto_redirect;
 
 pub(crate) mod helpers;
 
@@ -141,6 +145,7 @@ impl MigratorTrait for Migrator {
             Box::new(m00040_credentials_public_key_user_id_index::Migration),
             Box::new(m00041_credentials_public_key_last_sso_at::Migration),
             Box::new(m00042_credentials_certificate_last_sso_at::Migration),
+            Box::new(m00059_sso_auto_redirect::Migration),
         ]
     }
 }
