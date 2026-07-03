@@ -303,8 +303,23 @@ impl Api {
                             .await;
                     }
                 }
+                // Enumeration hardening: only surface the specific
+                // next-factor state (SsoNeeded/OtpNeeded/…) when the presented
+                // credential actually validated — a legitimate multi-factor step
+                // reachable only by proving a real credential. An invalid
+                // credential or unknown user returns a generic `Failed` (matching
+                // the unknown-user branch above) so the response can't be used to
+                // distinguish whether an account exists or which auth method it
+                // uses. The SPA renders available methods from instance config
+                // (password_login_mode + SSO providers), not from this per-username
+                // response, so no UX is lost.
+                let response_state = if credential_valid {
+                    x.into()
+                } else {
+                    ApiAuthState::Failed
+                };
                 Ok(LoginResponse::Failure(Json(LoginFailureResponse {
-                    state: x.into(),
+                    state: response_state,
                     credential_rejected: !credential_valid,
                 })))
             }
