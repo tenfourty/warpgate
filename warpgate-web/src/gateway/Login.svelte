@@ -47,8 +47,29 @@
         await continueWithState()
     }
 
+    // Only same-origin relative paths or absolute http(s) URLs are accepted as
+    // post-login redirect targets. Rejects `javascript:` / `data:` URIs (DOM XSS
+    // via the `next` query param) and protocol-relative `//host` open-redirects.
+    // Mirrors the server-side `is_safe_redirect_target` guard in
+    // warpgate-protocol-http/src/api/sso_provider_list.rs.
+    function isSafeRedirectTarget (next: string | undefined): boolean {
+        if (!next) {
+            return false
+        }
+        if (next.startsWith('/')) {
+            // Relative path, but not protocol-relative ("//host")
+            return !next.startsWith('//')
+        }
+        try {
+            const u = new URL(next)
+            return u.protocol === 'http:' || u.protocol === 'https:'
+        } catch {
+            return false
+        }
+    }
+
     function success () {
-        if (nextURL) {
+        if (nextURL && isSafeRedirectTarget(nextURL)) {
             location.assign(nextURL)
         } else {
             replace('/')
