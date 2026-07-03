@@ -94,7 +94,7 @@ fn make_redirect_url(err: &str) -> String {
 /// Only relative paths and absolute `http(s)` URLs are accepted as post-login
 /// redirect targets. This rejects schemes such as `javascript:` or `data:` and
 /// protocol-relative `//host` URLs.
-fn is_safe_redirect_target(next: &str) -> bool {
+pub(crate) fn is_safe_redirect_target(next: &str) -> bool {
     if let Some(rest) = next.strip_prefix('/') {
         // Relative path, but not protocol-relative ("//host")
         return !rest.starts_with('/');
