@@ -630,6 +630,28 @@
                                         first.
                                     </HelpText>
 
+                                    <label
+                                        for="ssoAutoRedirect"
+                                        class="d-flex align-items-center"
+                                    >
+                                        <Input
+                                            id="ssoAutoRedirect"
+                                            class="mb-0 me-2"
+                                            type="switch"
+                                            bind:checked={parameters.ssoAutoRedirect}
+                                        />
+                                        <div>Auto-redirect to SSO provider</div>
+                                    </label>
+                                    <HelpText>
+                                        When exactly one SSO provider is
+                                        configured, unauthenticated browser
+                                        navigations are redirected straight to
+                                        the provider instead of showing the
+                                        login page. Append
+                                        <code>?login=password</code> to any URL
+                                        to reach the password login form.
+                                    </HelpText>
+
                                     <FormGroup
                                         floating
                                         label="Require re-authentication after (blank = never)"

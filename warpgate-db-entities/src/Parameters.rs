@@ -176,6 +176,10 @@ pub struct Model {
     pub ssh_client_auth_keyboard_interactive: bool,
     pub ssh_host_key_verification: SshHostKeyVerificationMode,
     pub password_login_mode: PasswordLoginMode,
+    /// When true (and exactly one SSO provider is configured), an
+    /// unauthenticated browser navigation is 302-redirected straight to the
+    /// SSO provider's authorize URL instead of the gateway login SPA.
+    pub sso_auto_redirect: bool,
     pub ticket_self_service_enabled: bool,
     pub ticket_auto_approve_existing_access: bool,
     pub ticket_max_duration_seconds: Option<i64>,
@@ -280,6 +284,7 @@ impl Entity {
                         get_config_migration_values().ssh_host_key_verification
                     ),
                     password_login_mode: Set(PasswordLoginMode::Enabled),
+                    sso_auto_redirect: Set(false),
                     ticket_self_service_enabled: Set(false),
                     ticket_auto_approve_existing_access: Set(true),
                     ticket_max_duration_seconds: Set(Some(28800)),

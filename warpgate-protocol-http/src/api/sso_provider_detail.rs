@@ -48,6 +48,104 @@ pub struct SsoContext {
     pub return_origin: String,
 }
 
+/// Outcome of [`start_sso_and_get_auth_url`]. Mirrors the arms of
+/// [`StartSsoResponse`] so both the OpenAPI handler and the auto-redirect
+/// path in `common::page_auth` can share the login-initiation machinery.
+pub(crate) enum StartSsoOutcome {
+    /// Provider found; SSO context stored in the session. Carries the IdP
+    /// authorize URL to redirect the browser to.
+    Ok(String),
+    /// No SSO provider with the given name is configured.
+    NotFound,
+    /// The request host has no cookie-domain relationship with `external_host`
+    /// while the provider prefers `external_host` for its return URL.
+    IncompatibleSsoDomain,
+}
+
+/// Begin an SSO login for `provider_name`: build the return URL, ask the IdP
+/// client for an authorize URL, and stash the resulting [`SsoContext`] in the
+/// session under [`SSO_CONTEXT_SESSION_KEY`] so `sso/return` can complete the
+/// handshake. Extracted from `api_start_sso` so the unauthenticated
+/// auto-redirect path can reuse it. Locks `config` internally — callers must
+/// NOT hold the config lock.
+pub(crate) async fn start_sso_and_get_auth_url(
+    req: &Request,
+    session: &Session,
+    ctx: &UnauthenticatedRequestContext,
+    provider_name: &str,
+    next: Option<String>,
+) -> Result<StartSsoOutcome, WarpgateError> {
+    let config = ctx.services().config.lock().await;
+
+    let Some(provider_config) = config
+        .store
+        .sso_providers
+        .iter()
+        .find(|p| p.name == *provider_name)
+    else {
+        return Ok(StartSsoOutcome::NotFound);
+    };
+
+    if matches!(
+        provider_config.return_url_domain,
+        SsoReturnUrlDomainPreference::ExternalHost
+    ) && let (Some(request_host), Some(external_host)) = (
+        ctx.trusted_hostname(req),
+        config.store.external_host.as_deref(),
+    ) && !is_localhost_host(&request_host)
+        && !host_is_subdomain_of_or_equal(&request_host, external_host)
+    {
+        return Ok(StartSsoOutcome::IncompatibleSsoDomain);
+    }
+
+    let mut return_url = construct_external_url(
+        match provider_config.return_url_domain {
+            // Let `construct_external_url` fall back to config file
+            SsoReturnUrlDomainPreference::ExternalHost => None,
+            SsoReturnUrlDomainPreference::HostHeader => Some(req),
+        },
+        &config,
+        provider_config.return_domain_whitelist.as_deref(),
+    )
+    .await?;
+    return_url.set_path(&format!(
+        "{}warpgate/api/sso/return",
+        provider_config.return_url_prefix
+    ));
+    debug!("Return URL: {return_url}");
+
+    // The post-login redirect lands on the host the user started from, which
+    // in `external_host` mode is not the return URL's host — the IdP callback
+    // goes to the parent domain there and hands off via the shared cookie.
+    // Built through `construct_external_url` so the authority is parsed
+    // rather than interpolated from the raw `Host` header. No whitelist is
+    // passed because this host has already been checked: `external_host` mode
+    // by the `IncompatibleSsoDomain` guard above, `host_header` mode by the
+    // return URL, which is this same host.
+    let return_origin = construct_external_url(Some(req), &config, None)
+        .await?
+        .origin()
+        .ascii_serialization();
+
+    let client = SsoClient::new(provider_config.provider.clone())?;
+
+    let sso_req = client.start_login(return_url.to_string()).await?;
+
+    let url = sso_req.auth_url().to_string();
+    session.set(
+        SSO_CONTEXT_SESSION_KEY,
+        SsoContext {
+            provider: provider_name.to_owned(),
+            request: sso_req,
+            next_url: next,
+            supports_single_logout: client.supports_single_logout().await?,
+            return_origin,
+        },
+    );
+
+    Ok(StartSsoOutcome::Ok(url))
+}
+
 #[OpenApi]
 impl Api {
     #[oai(
@@ -63,72 +161,12 @@ impl Api {
         name: Path<String>,
         next: Query<Option<String>>,
     ) -> Result<StartSsoResponse, WarpgateError> {
-        let config = ctx.services().config.lock().await;
-
-        let name = name.0;
-
-        let Some(provider_config) = config.store.sso_providers.iter().find(|p| p.name == *name)
-        else {
-            return Ok(StartSsoResponse::NotFound);
-        };
-
-        if matches!(
-            provider_config.return_url_domain,
-            SsoReturnUrlDomainPreference::ExternalHost
-        ) && let (Some(request_host), Some(external_host)) = (
-            ctx.trusted_hostname(req),
-            config.store.external_host.as_deref(),
-        ) && !is_localhost_host(&request_host)
-            && !host_is_subdomain_of_or_equal(&request_host, external_host)
-        {
-            return Ok(StartSsoResponse::IncompatibleSsoDomain);
+        match start_sso_and_get_auth_url(req, session, ctx.0, &name.0, next.0).await? {
+            StartSsoOutcome::Ok(url) => {
+                Ok(StartSsoResponse::Ok(Json(StartSsoResponseParams { url })))
+            }
+            StartSsoOutcome::NotFound => Ok(StartSsoResponse::NotFound),
+            StartSsoOutcome::IncompatibleSsoDomain => Ok(StartSsoResponse::IncompatibleSsoDomain),
         }
-
-        let mut return_url = construct_external_url(
-            match provider_config.return_url_domain {
-                // Let `construct_external_url` fall back to config file
-                SsoReturnUrlDomainPreference::ExternalHost => None,
-                SsoReturnUrlDomainPreference::HostHeader => Some(req),
-            },
-            &config,
-            provider_config.return_domain_whitelist.as_deref(),
-        )
-        .await?;
-        return_url.set_path(&format!(
-            "{}warpgate/api/sso/return",
-            provider_config.return_url_prefix
-        ));
-        debug!("Return URL: {return_url}");
-
-        // The post-login redirect lands on the host the user started from, which
-        // in `external_host` mode is not the return URL's host — the IdP callback
-        // goes to the parent domain there and hands off via the shared cookie.
-        // Built through `construct_external_url` so the authority is parsed
-        // rather than interpolated from the raw `Host` header. No whitelist is
-        // passed because this host has already been checked: `external_host` mode
-        // by the `IncompatibleSsoDomain` guard above, `host_header` mode by the
-        // return URL, which is this same host.
-        let return_origin = construct_external_url(Some(req), &config, None)
-            .await?
-            .origin()
-            .ascii_serialization();
-
-        let client = SsoClient::new(provider_config.provider.clone())?;
-
-        let sso_req = client.start_login(return_url.to_string()).await?;
-
-        let url = sso_req.auth_url().to_string();
-        session.set(
-            SSO_CONTEXT_SESSION_KEY,
-            SsoContext {
-                provider: name,
-                request: sso_req,
-                next_url: next.0.clone(),
-                supports_single_logout: client.supports_single_logout().await?,
-                return_origin,
-            },
-        );
-
-        Ok(StartSsoResponse::Ok(Json(StartSsoResponseParams { url })))
     }
 }

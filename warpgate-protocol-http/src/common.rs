@@ -120,13 +120,20 @@ pub async fn is_user_admin(ctx: &AuthenticatedRequestContext) -> poem::Result<bo
         .is_admin())
 }
 
+/// Run the per-request authentication gate.
+///
+/// Returns `Ok(Ok(output))` when the request is authenticated (the wrapped
+/// endpoint was called), or `Ok(Err(req))` when it is not — handing the
+/// untouched `Request` back to the caller so it can build a redirect / 401
+/// response (see `page_auth`, which needs the request to compute an SSO
+/// auto-redirect on the unauthenticated path).
 pub async fn _inner_auth<E: Endpoint + 'static>(
     ep: Arc<E>,
     req: Request,
-) -> poem::Result<Option<E::Output>> {
+) -> poem::Result<Result<E::Output, Request>> {
     let ctx = Option::<Data<&AuthenticatedRequestContext>>::from_request_without_body(&req).await?;
     let Some(ctx) = ctx else {
-        return Ok(None);
+        return Ok(Err(req));
     };
 
     // Per-session SSO step-up gate. If the session is authed as a `User` (not
@@ -171,12 +178,12 @@ pub async fn _inner_auth<E: Endpoint + 'static>(
                 // re-login can still complete its OAuth handshake.
                 session.clear_auth();
                 session.clear_last_sso_at();
-                return Ok(None);
+                return Ok(Err(req));
             }
         }
     }
 
-    return ep.call(req).await.map(Some);
+    return ep.call(req).await.map(Ok);
 }
 
 // TODO unify both based on the accept header
@@ -184,7 +191,7 @@ pub fn endpoint_auth<E: Endpoint + 'static>(e: E) -> impl Endpoint<Output = E::O
     e.around(|ep, req| async move {
         _inner_auth(ep, req)
             .await?
-            .ok_or_else(|| poem::Error::from_status(StatusCode::UNAUTHORIZED))
+            .map_err(|_req| poem::Error::from_status(StatusCode::UNAUTHORIZED))
     })
 }
 
@@ -215,11 +222,127 @@ pub fn page_auth<E: Endpoint + 'static>(e: E) -> impl Endpoint {
             PublicBypassOutcome::NotApplicable => {}
         }
 
-        let err_resp = gateway_redirect(&req).into_response();
-        Ok(_inner_auth(ep, req)
-            .await?
-            .map_or(err_resp, IntoResponse::into_response))
+        match _inner_auth(ep, req).await? {
+            Ok(output) => Ok(output.into_response()),
+            Err(req) => {
+                // Unauthenticated navigation. If the operator has opted into
+                // single-provider SSO auto-redirect, jump straight to the IdP
+                // authorize URL (preserving the original path) instead of
+                // flashing the gateway login SPA. Otherwise fall through to the
+                // existing gateway-redirect / 401 behaviour unchanged.
+                if let Some(resp) = try_auto_sso_redirect(&req).await? {
+                    return Ok(resp);
+                }
+                Ok(gateway_redirect(&req).into_response())
+            }
+        }
     })
+}
+
+/// Pure decision for the single-provider SSO auto-redirect. Kept side-effect
+/// free so every branch can be unit-tested without a `Services` fixture.
+///
+/// Returns true iff the feature is enabled, exactly one SSO provider is
+/// configured, the request is a top-level browser navigation, the break-glass
+/// `?login=password` bypass is absent, and the target is not a Warpgate
+/// management path.
+pub(crate) const fn should_auto_sso_redirect(
+    sso_auto_redirect_enabled: bool,
+    sso_provider_count: usize,
+    is_navigation: bool,
+    has_password_bypass: bool,
+    is_management_path: bool,
+) -> bool {
+    sso_auto_redirect_enabled
+        && sso_provider_count == 1
+        && is_navigation
+        && !has_password_bypass
+        && !is_management_path
+}
+
+/// Whether the request is a top-level browser navigation, using the same
+/// `sec-fetch-mode` heuristic as [`gateway_redirect`] (header absent or
+/// explicitly `navigate`).
+fn request_is_navigation(req: &Request) -> bool {
+    match req.headers().get(HeaderName::from_static("sec-fetch-mode")) {
+        Some(mode) => mode == "navigate",
+        None => true,
+    }
+}
+
+/// Break-glass: a `?login=password` query param bypasses the auto-redirect so
+/// an operator can always reach the SPA password login.
+fn request_has_password_bypass(req: &Request) -> bool {
+    req.uri().query().is_some_and(|q| {
+        url::form_urlencoded::parse(q.as_bytes()).any(|(k, v)| k == "login" && v == "password")
+    })
+}
+
+/// On the unauthenticated navigation path, consult the `sso_auto_redirect`
+/// parameter + configured SSO providers and, when appropriate, initiate an SSO
+/// login and return a 302 to the IdP authorize URL. Returns `Ok(None)` to let
+/// the caller fall through to the normal gateway redirect / 401.
+async fn try_auto_sso_redirect(req: &Request) -> poem::Result<Option<Response>> {
+    let ctx = Data::<&UnauthenticatedRequestContext>::from_request_without_body(req).await?;
+
+    let is_navigation = request_is_navigation(req);
+    let has_password_bypass = request_has_password_bypass(req);
+    let is_management_path = is_warpgate_management_path(req.uri().path());
+
+    // Cheap gates first — avoid the DB read + config lock unless the request
+    // could actually be redirected.
+    if !is_navigation || has_password_bypass || is_management_path {
+        return Ok(None);
+    }
+
+    let sso_auto_redirect_enabled = ctx
+        .parameters()
+        .await
+        .map_err(InternalServerError)?
+        .sso_auto_redirect;
+
+    // Read the sole provider's name (if exactly one), then drop the config
+    // lock before calling the SSO helper, which re-locks it internally.
+    let sole_provider = {
+        let config = ctx.services().config.lock().await;
+        let providers = &config.store.sso_providers;
+        if should_auto_sso_redirect(
+            sso_auto_redirect_enabled,
+            providers.len(),
+            is_navigation,
+            has_password_bypass,
+            is_management_path,
+        ) {
+            providers.first().map(|p| p.name.clone())
+        } else {
+            None
+        }
+    };
+
+    let Some(provider_name) = sole_provider else {
+        return Ok(None);
+    };
+
+    let session = <&Session>::from_request_without_body(req).await?;
+    let next = req.original_uri().path_and_query().map(ToString::to_string);
+
+    match crate::api::sso_provider_detail::start_sso_and_get_auth_url(
+        req,
+        session,
+        ctx.0,
+        &provider_name,
+        next,
+    )
+    .await?
+    {
+        crate::api::sso_provider_detail::StartSsoOutcome::Ok(url) => {
+            Ok(Some(Redirect::temporary(url).into_response()))
+        }
+        // Provider vanished between the count check and the start (race), or the
+        // request host is incompatible with the provider's return-URL domain.
+        // Fall through to the normal login page rather than erroring.
+        _ => Ok(None),
+    }
 }
 
 /// Result of `try_public_target_bypass`. See [`page_auth`] for how each
@@ -580,7 +703,10 @@ pub async fn inject_request_authorization<E: Endpoint + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use super::{StatusCode, gateway_redirect, host_is_subdomain_of_or_equal};
+    use super::{
+        StatusCode, gateway_redirect, host_is_subdomain_of_or_equal, request_has_password_bypass,
+        request_is_navigation, should_auto_sso_redirect,
+    };
 
     #[test]
     fn gateway_redirect_navigation_redirects_to_login() {
@@ -611,6 +737,84 @@ mod tests {
             let resp = gateway_redirect(&req);
             assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         }
+    }
+
+    #[test]
+    fn auto_sso_redirect_happy_path() {
+        // Enabled, exactly one provider, a navigation, no bypass, not a
+        // management path → redirect.
+        assert!(should_auto_sso_redirect(true, 1, true, false, false));
+    }
+
+    #[test]
+    fn auto_sso_redirect_disabled_by_default() {
+        // Feature off → never redirect regardless of other inputs.
+        assert!(!should_auto_sso_redirect(false, 1, true, false, false));
+    }
+
+    #[test]
+    fn auto_sso_redirect_requires_exactly_one_provider() {
+        // Zero providers → nothing to redirect to.
+        assert!(!should_auto_sso_redirect(true, 0, true, false, false));
+        // Multiple providers → user must choose, keep the SPA.
+        assert!(!should_auto_sso_redirect(true, 2, true, false, false));
+    }
+
+    #[test]
+    fn auto_sso_redirect_only_on_navigation() {
+        // Non-navigation (fetch/XHR) must not be hijacked into a 302.
+        assert!(!should_auto_sso_redirect(true, 1, false, false, false));
+    }
+
+    #[test]
+    fn auto_sso_redirect_break_glass_bypass() {
+        // ?login=password forces the SPA login even when otherwise eligible.
+        assert!(!should_auto_sso_redirect(true, 1, true, true, false));
+    }
+
+    #[test]
+    fn auto_sso_redirect_skips_management_paths() {
+        // Warpgate's own admin/gateway surfaces are never auto-redirected.
+        assert!(!should_auto_sso_redirect(true, 1, true, false, true));
+    }
+
+    #[test]
+    fn request_is_navigation_matches_gateway_redirect_heuristic() {
+        // Header absent → treat as navigation.
+        let req = poem::Request::builder().uri_str("/foo").finish();
+        assert!(request_is_navigation(&req));
+        // Explicit navigate → navigation.
+        let req = poem::Request::builder()
+            .uri_str("/foo")
+            .header("sec-fetch-mode", "navigate")
+            .finish();
+        assert!(request_is_navigation(&req));
+        // Any other mode → not a navigation.
+        for mode in ["cors", "same-origin", "no-cors"] {
+            let req = poem::Request::builder()
+                .uri_str("/foo")
+                .header("sec-fetch-mode", mode)
+                .finish();
+            assert!(!request_is_navigation(&req));
+        }
+    }
+
+    #[test]
+    fn request_has_password_bypass_detects_query() {
+        let req = poem::Request::builder()
+            .uri_str("/foo?login=password")
+            .finish();
+        assert!(request_has_password_bypass(&req));
+        // Alongside other params.
+        let req = poem::Request::builder()
+            .uri_str("/foo?next=%2Fbar&login=password")
+            .finish();
+        assert!(request_has_password_bypass(&req));
+        // Absent / different value.
+        let req = poem::Request::builder().uri_str("/foo").finish();
+        assert!(!request_has_password_bypass(&req));
+        let req = poem::Request::builder().uri_str("/foo?login=sso").finish();
+        assert!(!request_has_password_bypass(&req));
     }
 
     #[test]

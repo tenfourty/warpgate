@@ -94,6 +94,10 @@ mod m00079_unique_target_and_group_names;
 mod m00040_credentials_public_key_user_id_index;
 mod m00041_credentials_public_key_last_sso_at;
 mod m00042_credentials_certificate_last_sso_at;
+// Opt-in auto-redirect to the sole SSO provider. Upstream owns a different
+// `m00059_web_auth_max_age`; the numeric prefix collides but the module name
+// (and therefore the migration identity) does not.
+mod m00059_sso_auto_redirect;
 
 pub(crate) mod helpers;
 
@@ -186,6 +190,7 @@ impl MigratorTrait for Migrator {
             Box::new(m00040_credentials_public_key_user_id_index::Migration),
             Box::new(m00041_credentials_public_key_last_sso_at::Migration),
             Box::new(m00042_credentials_certificate_last_sso_at::Migration),
+            Box::new(m00059_sso_auto_redirect::Migration),
         ]
     }
 }

@@ -115,6 +115,7 @@ pub struct Info {
     external_hosts: Option<ExternalHostsInfo>,
     ports: PortsInfo,
     password_login_mode: Parameters::PasswordLoginMode,
+    sso_auto_redirect: bool,
     /// Deprecated in 0.26: superseded by `password_login_mode`
     minimize_password_login: bool,
     authorized_via_ticket: bool,
@@ -284,6 +285,7 @@ impl Api {
             selected_target: session.get_target_name(),
             external_host,
             password_login_mode: parameters.password_login_mode,
+            sso_auto_redirect: parameters.sso_auto_redirect,
             minimize_password_login: parameters.password_login_mode
                 == Parameters::PasswordLoginMode::Minimized,
             authorized_via_ticket: matches!(
