@@ -6,6 +6,7 @@ mod middleware;
 pub mod proxy;
 mod session;
 mod session_handle;
+mod sso_request_store;
 mod step_up;
 
 use std::fmt::Debug;
@@ -112,6 +113,8 @@ impl ProtocolServer for HTTPProtocolServer {
     async fn run(self, address: ListenEndpoint) -> Result<()> {
         let session_storage = make_session_storage();
         let session_store = SessionStore::new();
+        let sso_request_store: crate::sso_request_store::SsoRequestStore =
+            crate::sso_request_store::SsoRequestStore::new();
 
         let cache_bust = || {
             SetHeader::new().overriding(
@@ -301,11 +304,13 @@ impl ProtocolServer for HTTPProtocolServer {
             .with(CookieHostMiddleware::new(base_cookie_domain))
             .data(UnauthenticatedRequestContext::new(self.services.clone()).await)
             .data(session_store.clone())
+            .data(sso_request_store.clone())
             .data(session_storage);
 
         tokio::spawn(async move {
             loop {
                 session_store.lock().await.vacuum(session_max_age);
+                sso_request_store.vacuum().await;
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }
         });
