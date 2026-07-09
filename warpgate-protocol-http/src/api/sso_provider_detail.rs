@@ -1,7 +1,8 @@
+use anyhow::Context;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
-use poem::Request;
 use poem::session::Session;
 use poem::web::Data;
+use poem::{FromRequest, Request};
 use poem_openapi::param::{Path, Query};
 use poem_openapi::payload::{Json, Response};
 use poem_openapi::{ApiResponse, Object, OpenApi};
@@ -44,8 +45,6 @@ enum AutoStartSsoResponse {
     Redirect,
 }
 
-pub static SSO_CONTEXT_SESSION_KEY: &str = "sso_request";
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SsoContext {
     pub provider: String,
@@ -63,8 +62,8 @@ pub struct SsoContext {
 /// [`StartSsoResponse`] so both the OpenAPI handler and the auto-redirect
 /// path in `common::page_auth` can share the login-initiation machinery.
 pub(crate) enum StartSsoOutcome {
-    /// Provider found; SSO context stored in the session. Carries the IdP
-    /// authorize URL to redirect the browser to.
+    /// Provider found; SSO handshake stashed in the request store. Carries the
+    /// IdP authorize URL to redirect the browser to.
     Ok(String),
     /// No SSO provider with the given name is configured.
     NotFound,
@@ -75,13 +74,16 @@ pub(crate) enum StartSsoOutcome {
 
 /// Begin an SSO login for `provider_name`: build the return URL, ask the IdP
 /// client for an authorize URL, and stash the resulting [`SsoContext`] in the
-/// session under [`SSO_CONTEXT_SESSION_KEY`] so `sso/return` can complete the
+/// [`crate::sso_request_store::SsoRequestStore`], keyed by the OAuth `state`,
+/// so `sso/return` can complete the
 /// handshake. Extracted from `api_start_sso` so the unauthenticated
 /// auto-redirect path can reuse it. Locks `config` internally — callers must
 /// NOT hold the config lock.
 pub(crate) async fn start_sso_and_get_auth_url(
     req: &Request,
-    session: &Session,
+    // The handshake now lives in the SsoRequestStore, not the Poem session, so
+    // `session` is no longer read here (kept for call-site symmetry).
+    _session: &Session,
     ctx: &UnauthenticatedRequestContext,
     provider_name: &str,
     next: Option<String>,
@@ -143,16 +145,31 @@ pub(crate) async fn start_sso_and_get_auth_url(
     let sso_req = client.start_login(return_url.to_string()).await?;
 
     let url = sso_req.auth_url().to_string();
-    session.set(
-        SSO_CONTEXT_SESSION_KEY,
-        SsoContext {
-            provider: provider_name.to_owned(),
-            request: sso_req,
-            next_url: next,
-            supports_single_logout: client.supports_single_logout().await?,
-            return_origin,
-        },
-    );
+    // The OAuth `state` (CSRF token) the IdP echoes back on the callback — the
+    // key under which `/sso/return` retrieves this handshake.
+    let state = sso_req.csrf_token().secret().clone();
+    let supports_single_logout = client.supports_single_logout().await?;
+    let context = SsoContext {
+        provider: provider_name.to_owned(),
+        request: sso_req,
+        next_url: next,
+        supports_single_logout,
+        return_origin,
+    };
+
+    // Stash the handshake in the SsoRequestStore keyed by `state` and bound to
+    // the initiating session — NOT in the Poem session, whose single
+    // read-modify-write blob is clobbered by concurrent requests that share the
+    // cross-subdomain cookie (the auto-SSO redirect, other subdomain tabs, the
+    // SPA's auth-state polls). See `crate::sso_request_store`.
+    let session_id = crate::common::session_id_for_request(req, ctx).await?;
+    let sso_store =
+        Data::<&crate::sso_request_store::SsoRequestStore<SsoContext>>::from_request_without_body(
+            req,
+        )
+        .await
+        .context("SsoRequestStore not in request")?;
+    sso_store.insert(state, context, session_id).await;
 
     Ok(StartSsoOutcome::Ok(url))
 }
@@ -223,7 +240,7 @@ impl Api {
             if should_auto_sso_redirect(
                 enabled,
                 providers.len(),
-                true,  // only reached as a top-level browser navigation
+                true, // only reached as a top-level browser navigation
                 has_password_bypass,
                 false, // dedicated endpoint, not a management-path proxy hit
             ) {
@@ -235,7 +252,8 @@ impl Api {
 
         if let Some(provider_name) = sole_provider
             && let StartSsoOutcome::Ok(url) =
-                start_sso_and_get_auth_url(req, session, ctx.0, &provider_name, next.clone()).await?
+                start_sso_and_get_auth_url(req, session, ctx.0, &provider_name, next.clone())
+                    .await?
         {
             return Ok(Response::new(AutoStartSsoResponse::Redirect).header("Location", url));
         }

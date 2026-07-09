@@ -7,6 +7,7 @@ mod middleware;
 pub mod proxy;
 mod session;
 mod session_handle;
+mod sso_request_store;
 mod step_up;
 
 use std::fmt::Debug;
@@ -124,6 +125,8 @@ impl ProtocolServer for HTTPProtocolServer {
         let session_storage = SharedSessionStorage(self.services.db.clone());
         let session_store = SessionStore::new();
         let http_client_cache = HttpClientCache::default();
+        let sso_request_store: crate::sso_request_store::SsoRequestStore =
+            crate::sso_request_store::SsoRequestStore::new();
 
         let cache_bust = || {
             SetHeader::new().overriding(
@@ -340,6 +343,7 @@ impl ProtocolServer for HTTPProtocolServer {
             .data(UnauthenticatedRequestContext::new(self.services.clone()).await)
             .data(http_client_cache.clone())
             .data(session_store.clone())
+            .data(sso_request_store.clone())
             .data(session_storage.clone());
 
         tokio::spawn(async move {
@@ -349,6 +353,7 @@ impl ProtocolServer for HTTPProtocolServer {
                     warn!(%error, "Failed to expire stored HTTP sessions");
                 }
                 http_client_cache.vacuum().await;
+                sso_request_store.vacuum().await;
                 tokio::time::sleep(HTTP_CLIENT_CACHE_VACUUM_INTERVAL).await;
             }
         });
