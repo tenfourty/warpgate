@@ -142,6 +142,14 @@ pub(crate) async fn start_sso_and_get_auth_url(
 
     let client = SsoClient::new(provider_config.provider.clone())?;
 
+    // Release the global `config` lock before the IdP network round-trip
+    // (`start_login`) and `session_id_for_request` (which locks the SessionStore).
+    // Both the SSH and HTTP front-ends take this same lock per connection, so
+    // holding it across these awaits serializes the whole gateway and wedges it
+    // under concurrent SSO load — new SSH handshakes and HTTP requests block on
+    // `config` while a single login is mid-flight against the IdP.
+    drop(config);
+
     let sso_req = client.start_login(return_url.to_string()).await?;
 
     let url = sso_req.auth_url().to_string();
