@@ -18,14 +18,14 @@ use warpgate_core::ConfigProvider;
 use warpgate_core::auth::validate_and_add_credential;
 use warpgate_sso::{RoleMapping, SsoClient, SsoInternalProviderConfig};
 
-use super::sso_provider_detail::{SSO_CONTEXT_SESSION_KEY, SsoContext};
-use crate::step_up::StepUpSessionExt;
+use super::sso_provider_detail::SsoContext;
 use crate::SsoLoginState;
 use crate::api::common::{emit_unknown_authentication_failed_event, logout};
 use crate::common::{
     SessionExt, authorize_session, get_or_create_auth_state_for_request, session_id_for_request,
 };
 use crate::session::SessionStore;
+use crate::step_up::StepUpSessionExt;
 
 pub struct Api;
 
@@ -147,11 +147,19 @@ impl Api {
         req: &Request,
         session: &Session,
         ctx: Data<&UnauthenticatedRequestContext>,
+        sso_store: Data<&crate::sso_request_store::SsoRequestStore>,
         code: Query<Option<String>>,
         state: Query<Option<String>>,
     ) -> Result<Response<ReturnToSsoResponse>, WarpgateError> {
         let url = self
-            .api_return_to_sso_get_common(req, session, ctx, code.as_ref(), state.as_ref())
+            .api_return_to_sso_get_common(
+                req,
+                session,
+                ctx,
+                sso_store,
+                code.as_ref(),
+                state.as_ref(),
+            )
             .await?
             .unwrap_or_else(|x| make_redirect_url(&x));
 
@@ -168,6 +176,7 @@ impl Api {
         req: &Request,
         session: &Session,
         ctx: Data<&UnauthenticatedRequestContext>,
+        sso_store: Data<&crate::sso_request_store::SsoRequestStore>,
         data: Form<ReturnToSsoFormData>,
         state: Query<Option<String>>,
     ) -> Result<ReturnToSsoPostResponse, WarpgateError> {
@@ -176,6 +185,7 @@ impl Api {
                 req,
                 session,
                 ctx,
+                sso_store,
                 data.code.as_ref(),
                 data.state.as_ref().or(state.as_ref()),
             )
@@ -205,13 +215,17 @@ impl Api {
         req: &Request,
         session: &Session,
         ctx: Data<&UnauthenticatedRequestContext>,
+        sso_store: Data<&crate::sso_request_store::SsoRequestStore>,
         code: Option<&String>,
         state: Option<&String>,
     ) -> Result<Result<String, String>, WarpgateError> {
         // pull services locally for convenience
         let services = ctx.services();
-        let Some(context) = session.get::<SsoContext>(SSO_CONTEXT_SESSION_KEY) else {
-            return Ok(Err("Not in an active SSO process".to_string()));
+
+        let Some(state) = state else {
+            return Ok(Err(
+                "No SSO state parameter in the return request".to_string()
+            ));
         };
 
         let Some(code) = code else {
@@ -220,12 +234,17 @@ impl Api {
             ));
         };
 
-        let Some(state) = state else {
-            return Ok(Err(
-                "No SSO state parameter in the return request".to_string()
-            ));
+        // Retrieve the handshake from the SsoRequestStore by the IdP-echoed
+        // `state`, bound to this session (see `crate::sso_request_store`) —
+        // NOT from the Poem session, which loses it under concurrency and is
+        // exactly what caused spurious "Invalid SSO state parameter" failures.
+        let session_id = session_id_for_request(req, ctx.0).await?;
+        let Some(context) = sso_store.take(state, &session_id).await else {
+            return Ok(Err("Not in an active SSO process".to_string()));
         };
 
+        // Defense in depth: the store already keyed by `state` and bound to the
+        // session, so this holds by construction; keep the explicit CSRF check.
         if !context.request.verify_state(state) {
             return Ok(Err("Invalid SSO state parameter".to_string()));
         }
