@@ -6,6 +6,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::Poll;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use bimap::BiMap;
@@ -140,6 +141,57 @@ fn format_web_auth_instructions(login_url: Option<Url>, identification_string: &
          Make sure you're seeing this security key: {spaced_key}\n\
          -----------------------------------------------------------------------\n"
     )
+}
+
+/// Text shown when the browser approval never arrived within the budget. It has
+/// to travel in a final zero-prompt `Auth::Partial`, because `Auth::Reject`
+/// carries no message field.
+const WEB_AUTH_NOT_CONFIRMED_MESSAGE: &str =
+    "\n[!] Browser authentication was not confirmed, please try again.\n";
+
+/// What an auto-continue web-approval round should do next.
+#[derive(Debug, PartialEq, Eq)]
+enum WebAuthStep {
+    Accept,
+    PollAgain { include_url: bool },
+    Reject { message: Option<String> },
+}
+
+/// The whole decision of an auto-continue round, as a pure function.
+///
+/// It takes the **verdict** that `try_auth_lazy` just returned, never a raw
+/// wake event: being woken is not evidence of approval, since the completion
+/// signal fires on a browser *rejection* as well. Only an explicit `Accepted`
+/// can accept.
+///
+/// It takes `url_shown` rather than a round number so that URL emission has
+/// exactly one source of truth, and it deliberately takes no wait counter — the
+/// per-connection wait cap is enforced on the wait-creation path, before this
+/// function is reached.
+fn next_web_auth_step(
+    now: Instant,
+    deadline: Option<Instant>,
+    url_shown: bool,
+    verdict: &AuthResult,
+) -> WebAuthStep {
+    match verdict {
+        // Wins even over an expired budget: by now `_auth_accept`, `complete()`
+        // and the `last_sso_at` stamp have already run, so rejecting on a stale
+        // deadline would discard a completed authentication.
+        AuthResult::Accepted { .. } => WebAuthStep::Accept,
+        AuthResult::Rejected => WebAuthStep::Reject { message: None },
+        AuthResult::Need(_) => {
+            if deadline.is_some_and(|deadline| now >= deadline) {
+                WebAuthStep::Reject {
+                    message: Some(WEB_AUTH_NOT_CONFIRMED_MESSAGE.to_owned()),
+                }
+            } else {
+                WebAuthStep::PollAgain {
+                    include_url: !url_shown,
+                }
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for ServerSession {
