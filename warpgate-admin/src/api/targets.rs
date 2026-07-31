@@ -568,6 +568,7 @@ mod tests {
             allow_insecure_algos: None,
             auth: SSHTargetAuth::PublicKey(SshTargetPublicKeyAuth::default()),
             env: None,
+            jump_host: None,
         })
     }
 
@@ -587,6 +588,10 @@ mod tests {
             options: Set(serde_json::to_value(options).unwrap()),
             rate_limit_bytes_per_second: Set(None),
             group_id: Set(None),
+            ticket_max_duration_seconds: Set(None),
+            ticket_requests_disabled: Set(false),
+            ticket_require_approval: Set(false),
+            ticket_max_uses: Set(None),
         }
         .insert(db)
         .await
