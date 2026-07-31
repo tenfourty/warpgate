@@ -741,7 +741,7 @@ impl WarpgateConfig {
 mod tests {
     use std::time::Duration;
 
-    use super::{StepUpIntervalConfig, WarpgateConfigStore};
+    use super::{SshConfig, StepUpIntervalConfig, WarpgateConfigStore};
 
     #[test]
     fn unit_step_up_interval_default_is_none() {
@@ -804,5 +804,12 @@ step_up_interval: {}
         assert!(s.kubernetes.is_none());
         assert!(s.mysql.is_none());
         assert!(s.postgres.is_none());
+    }
+
+    #[test]
+    fn unit_web_auth_auto_continue_config_defaults() {
+        let config = SshConfig::default();
+        assert_eq!(config.web_auth_auto_continue, false);
+        assert_eq!(config.web_auth_wait_timeout, Duration::from_secs(120));
     }
 }
