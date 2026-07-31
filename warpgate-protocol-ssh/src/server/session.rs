@@ -2795,8 +2795,8 @@ mod tests {
     use warpgate_common::auth::{AuthResult, AuthStateUserInfo, CredentialKind};
 
     use super::{
-        PendingKeyboardInteractiveAuth, WebApprovalWait, WebAuthStep, carry_forward,
-        next_web_auth_step, reject_with_allowed_auth_methods,
+        MAX_WEB_AUTH_WAITS, PendingKeyboardInteractiveAuth, WebApprovalWait, WebAuthStep,
+        bump_waits, carry_forward, next_web_auth_step, reject_with_allowed_auth_methods,
     };
 
     #[test]
@@ -2854,6 +2854,29 @@ mod tests {
                 .into_iter()
                 .collect::<HashSet<_>>(),
         )
+    }
+
+    /// I6: the cap counts **waits**, not rounds — three waits pass and the
+    /// fourth rejects. A per-round increment would reject real users at roughly
+    /// 30 s at the 10 s cadence, making the 2 m budget unreachable and the
+    /// farewell path dead code.
+    #[test]
+    fn unit_web_auth_wait_cap_permits_exactly_three_waits() {
+        assert_eq!(MAX_WEB_AUTH_WAITS, 3);
+        assert_eq!(bump_waits(0), (1, false));
+        assert_eq!(bump_waits(1), (2, false));
+        assert_eq!(bump_waits(2), (3, false));
+        assert_eq!(bump_waits(3), (4, true));
+    }
+
+    /// I6: the counter saturates rather than wrapping. Post-cap, every further
+    /// attempt still increments before rejecting, so a wrapping `u8` would hand
+    /// the client a fresh three-wait budget every ~256 attempts — silently,
+    /// since the release profile sets no `overflow-checks`.
+    #[test]
+    fn unit_web_auth_wait_cap_saturates_instead_of_wrapping() {
+        assert_eq!(bump_waits(u8::MAX), (u8::MAX, true));
+        assert_ne!(bump_waits(u8::MAX).0, 0);
     }
 
     /// I4: the wait — and therefore its live broadcast receiver — has to survive
