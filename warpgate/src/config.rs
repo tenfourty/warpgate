@@ -48,9 +48,11 @@ pub fn load_config(params: &GlobalParams, secure: bool) -> Result<WarpgateConfig
         ));
     }
 
-    let config = WarpgateConfig { store };
+    let mut config = WarpgateConfig { store };
 
     info!("Using config: {:?}", params.config_path());
+    // `validate` may correct values that parse but cannot take effect (see
+    // `MAX_WEB_AUTH_WAIT_TIMEOUT`), so it runs before the config is handed out.
     config.validate();
     Ok(config)
 }
