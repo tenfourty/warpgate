@@ -180,6 +180,15 @@ class ProcessManager:
                 "docker",
                 "run",
                 "--rm",
+                # On an SELinux-enforcing host the container is denied read
+                # access to the bind-mounted sshd_config below, so sshd exits 1
+                # before it ever binds port 22 and every SSH test fails with an
+                # opaque "Port is open but not responding" or an empty command
+                # result. Disabling the label for this throwaway test container
+                # is preferred over `:z`, which would persistently relabel
+                # tracked files in the working tree. No-op on non-SELinux hosts.
+                "--security-opt",
+                "label=disable",
                 "-p",
                 f"{port}:22",
                 "-v",
