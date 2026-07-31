@@ -1105,4 +1105,11 @@ step_up_interval: {}
         assert!(s.mysql.is_none());
         assert!(s.postgres.is_none());
     }
+
+    #[test]
+    fn unit_web_auth_auto_continue_config_defaults() {
+        let config = SshConfig::default();
+        assert!(!config.web_auth_auto_continue);
+        assert_eq!(config.web_auth_wait_timeout, Duration::from_secs(120));
+    }
 }
