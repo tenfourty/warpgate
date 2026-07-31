@@ -2941,7 +2941,7 @@ mod tests {
 
     use super::{
         MAX_WEB_AUTH_WAITS, PendingKeyboardInteractiveAuth, WebApprovalWait, WebAuthStep,
-        bump_waits, carry_forward, next_web_auth_step,
+        bump_waits, carry_forward, next_web_auth_step, wait_for_state,
     };
 
     fn accepted() -> AuthResult {
@@ -2959,6 +2959,66 @@ mod tests {
                 .into_iter()
                 .collect::<HashSet<_>>(),
         )
+    }
+
+    fn wait_bound_to(state_id: Uuid, sender: &broadcast::Sender<AuthResult>) -> WebApprovalWait {
+        WebApprovalWait {
+            receiver: Some(sender.subscribe()),
+            state_id,
+            deadline: None,
+            round: 7,
+            url_shown: true,
+            farewell: false,
+        }
+    }
+
+    /// I3: a wait is bound to one principal. `get_auth_state` mints a new
+    /// `AuthState` when the username changes, while a carried receiver still
+    /// points at the previous state's channel — so a mismatching state id must
+    /// discard the wait rather than let one principal's approval wake another's
+    /// session.
+    #[test]
+    fn unit_web_auth_state_id_mismatch_discards_the_wait() {
+        let (sender, _) = broadcast::channel::<AuthResult>(1);
+        let mine = Uuid::new_v4();
+        let theirs = Uuid::new_v4();
+
+        let kept = wait_for_state(Some(wait_bound_to(mine, &sender)), mine)
+            .expect("a wait bound to the current state must survive");
+        assert_eq!(kept.round, 7);
+        assert!(kept.receiver.is_some());
+
+        assert!(
+            wait_for_state(Some(kept), theirs).is_none(),
+            "a wait bound to a different state id must be discarded"
+        );
+    }
+
+    /// I6: the wait counter lives on the connection, not on the wait, so the I3
+    /// discard path inherits it. If a mid-connection username switch reset the
+    /// budget, a client could alternate usernames to sustain waits — and each
+    /// restart allocates an `AuthState` the store retains for ten minutes.
+    #[test]
+    fn unit_web_auth_discard_path_inherits_the_wait_counter() {
+        let (sender, _) = broadcast::channel::<AuthResult>(1);
+
+        // Three waits already spent on this connection.
+        let mut used = 0u8;
+        for _ in 0..MAX_WEB_AUTH_WAITS {
+            let (next, capped) = bump_waits(used);
+            used = next;
+            assert!(!capped);
+        }
+
+        // A username switch discards the carried wait entirely...
+        assert!(
+            wait_for_state(Some(wait_bound_to(Uuid::new_v4(), &sender)), Uuid::new_v4()).is_none()
+        );
+
+        // ...and the wait it forces is charged against the inherited count.
+        let (used, capped) = bump_waits(used);
+        assert_eq!(used, MAX_WEB_AUTH_WAITS + 1);
+        assert!(capped, "a discard must not restart the wait budget");
     }
 
     /// I6: the cap counts **waits**, not rounds — three waits pass and the
