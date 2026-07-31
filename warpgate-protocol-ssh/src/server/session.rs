@@ -160,6 +160,19 @@ const fn bump_waits(used: u8) -> (u8, bool) {
     (used, used > MAX_WEB_AUTH_WAITS)
 }
 
+/// Keep a carried wait only if it is bound to the auth state this round is
+/// evaluating; otherwise discard it so a new wait starts at round 1.
+///
+/// The discard drops the whole wait, receiver included. Nothing about the
+/// per-connection wait count is reachable from here, which is what makes the
+/// count inherited rather than reset by a mid-connection username switch.
+fn wait_for_state(
+    wait: Option<WebApprovalWait>,
+    identification_string: &str,
+) -> Option<WebApprovalWait> {
+    wait.filter(|wait| wait.identification_string == identification_string)
+}
+
 /// Consume the previous round's pending state and produce this round's, moving
 /// the web-approval wait — and therefore its live broadcast receiver — forward.
 ///
@@ -2374,9 +2387,7 @@ impl ServerSession {
         //    `get_auth_state` mints a new `AuthState` when the username changes,
         //    while the carried receiver still points at the old channel. The
         //    mismatched wait is dropped here and a new one starts at round 1.
-        let Some(mut wait) =
-            pending_wait.filter(|wait| wait.identification_string == identification_string)
-        else {
+        let Some(mut wait) = wait_for_state(pending_wait, &identification_string) else {
             // Charged on wait *creation* only, never per round: a per-round
             // increment against a cap of 3 would reject real users after roughly
             // 30 s, make the configured budget unreachable and turn the farewell
