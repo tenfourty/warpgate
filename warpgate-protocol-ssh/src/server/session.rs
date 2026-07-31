@@ -90,9 +90,61 @@ pub enum Event {
     ServerChannelOpenResult(Uuid, Result<ServerChannelId, russh::Error>),
 }
 
+/// State of an in-flight auto-continue web-approval wait, carried across
+/// keyboard-interactive rounds.
+///
+/// `waits_used` is deliberately **not** here: this struct is dropped on every
+/// terminal return, so a counter living here would reset and the cap could
+/// never fire. It lives on [`ServerSession`] instead.
+struct WebApprovalWait {
+    /// Early-wake signal for this state id. `Option` so a `Closed` receiver can
+    /// be dropped — a `select!` on a permanently-closed receiver returns
+    /// instantly and would spin rounds at client RTT.
+    receiver: Option<broadcast::Receiver<AuthResult>>,
+    /// The auth state this wait is bound to. A round whose current state id
+    /// differs discards the wait, so one principal's approval can never wake
+    /// another principal's session.
+    state_id: Uuid,
+    /// Budget expiry, set lazily at the first zero-prompt round so that time
+    /// spent typing an OTP does not eat the SSO budget.
+    deadline: Option<Instant>,
+    round: u8,
+    /// Single source of truth for whether the approval URL has been emitted.
+    url_shown: bool,
+    /// Set on the round that delivered the not-confirmed message; the next
+    /// round rejects.
+    farewell: bool,
+}
+
 struct PendingKeyboardInteractiveAuth {
     otp_prompt_sent: bool,
     web_approval_retry_count: Option<u8>,
+    web_approval_wait: Option<WebApprovalWait>,
+}
+
+impl PendingKeyboardInteractiveAuth {
+    const fn fresh() -> Self {
+        Self {
+            otp_prompt_sent: false,
+            web_approval_retry_count: None,
+            web_approval_wait: None,
+        }
+    }
+}
+
+/// Consume the previous round's pending state and produce this round's, moving
+/// the web-approval wait — and therefore its live broadcast receiver — forward.
+///
+/// The previous struct is consumed by value here rather than by a closure that
+/// only borrows what it needs, which is what makes the receiver actually
+/// survive: dropped, it leaves zero subscribers at the moment `complete()`
+/// sends, and the approval is only noticed at the next poll tick.
+fn carry_forward(previous: PendingKeyboardInteractiveAuth) -> PendingKeyboardInteractiveAuth {
+    PendingKeyboardInteractiveAuth {
+        otp_prompt_sent: false,
+        web_approval_retry_count: None,
+        web_approval_wait: previous.web_approval_wait,
+    }
 }
 
 enum ProbeState {
@@ -2088,15 +2140,22 @@ impl ServerSession {
         }
 
         let keyboard_interactive_state = self.keyboard_interactive_state.take();
-        let maybe_otp_cred = keyboard_interactive_state.as_ref().and_then(|s| {
-            if s.otp_prompt_sent {
-                responses.into_iter().next().map(AuthCredential::Otp)
-            } else {
-                None
-            }
-        });
-        let pending_web_auth_retries =
-            keyboard_interactive_state.and_then(|s| s.web_approval_retry_count);
+        let maybe_otp_cred = if keyboard_interactive_state
+            .as_ref()
+            .is_some_and(|s| s.otp_prompt_sent)
+        {
+            responses.into_iter().next().map(AuthCredential::Otp)
+        } else {
+            None
+        };
+        let pending_web_auth_retries = keyboard_interactive_state
+            .as_ref()
+            .and_then(|s| s.web_approval_retry_count);
+        // Destructure the taken struct exactly once and move its carried fields
+        // forward, so an in-flight wait's broadcast receiver is not dropped at
+        // the start of every round.
+        let mut next_pending = keyboard_interactive_state
+            .map_or_else(PendingKeyboardInteractiveAuth::fresh, carry_forward);
 
         Ok(match self.try_auth_lazy(&selector, maybe_otp_cred).await {
             Ok(AuthResult::Accepted { .. }) => russh::server::Auth::Accept,
@@ -2111,11 +2170,6 @@ impl ServerSession {
                         proceed_with_methods: None,
                         partial_success: false,
                     });
-                };
-
-                let mut next_pending = PendingKeyboardInteractiveAuth {
-                    otp_prompt_sent: false,
-                    web_approval_retry_count: None,
                 };
 
                 if kinds.contains(&CredentialKind::Totp) {
