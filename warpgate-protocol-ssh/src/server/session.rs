@@ -160,6 +160,31 @@ const fn bump_waits(used: u8) -> (u8, bool) {
     (used, used > MAX_WEB_AUTH_WAITS)
 }
 
+/// Whether a round entering with these inputs is going to create a wait, and so
+/// must charge one against the per-connection budget.
+///
+/// Two of the four blocks of [`ServerSession::web_approval_round_auto`] create a
+/// wait: the TOTP-outstanding block and the new-wait block. The cap counts waits
+/// regardless of which block created them, so a TOTP-plus-web user cannot get an
+/// uncharged wait and repeated TOTP-outstanding rounds cannot re-subscribe for
+/// free. The farewell block rejects and the poll block reuses the carried wait,
+/// so neither charges — the budget bounds waits, not rounds.
+fn round_creates_wait(
+    pending_wait: Option<&WebApprovalWait>,
+    identification_string: &str,
+    totp_outstanding: bool,
+) -> bool {
+    if pending_wait.is_some_and(|wait| wait.farewell) {
+        return false;
+    }
+    if totp_outstanding {
+        return true;
+    }
+    // Rounds 2..N reuse the carried wait; anything else starts a new one,
+    // including the discard of a wait bound to a different principal.
+    pending_wait.is_none_or(|wait| wait.identification_string != identification_string)
+}
+
 /// Keep a carried wait only if it is bound to the auth state this round is
 /// evaluating; otherwise discard it so a new wait starts at round 1.
 ///
@@ -2339,6 +2364,38 @@ impl ServerSession {
         let pending_wait = next_pending.web_approval_wait.take();
         // Copied out so no `AuthState` guard is alive past this statement.
         let identification_string = auth_state.lock().await.identification_string().to_owned();
+        let totp_outstanding = kinds.contains(&CredentialKind::Totp);
+
+        // Charged on wait *creation*, never per round: a per-round increment
+        // against a cap of 3 would reject real users after roughly 30 s, make the
+        // configured budget unreachable and turn the farewell path into dead
+        // code. Charged here, ahead of every block that creates one, so the cap
+        // counts waits regardless of which block created them — and ahead of
+        // `subscribe()` and any auth-state allocation, so a capped client stops
+        // allocating. The count lives on `ServerSession`, so a client alternating
+        // usernames to force the discard path below inherits it rather than
+        // resetting it.
+        if round_creates_wait(
+            pending_wait.as_ref(),
+            &identification_string,
+            totp_outstanding,
+        ) {
+            let (used, capped) = bump_waits(self.web_auth_waits_used);
+            self.web_auth_waits_used = used;
+            if capped {
+                warn!(
+                    waits_used = used,
+                    "Too many browser-approval waits on this connection"
+                );
+                // Deliberately no `self.auth_state = None`: keeping
+                // `get_auth_state`'s memoization means a capped client stops
+                // allocating auth states, each of which the store retains for
+                // ten minutes.
+                return Ok(WebApprovalRoundOutcome::Return(
+                    russh::server::Auth::reject(),
+                ));
+            }
+        }
 
         // 1. The not-confirmed message went out last round. Reject now, on the
         //    client's automatic empty response. Emitting no `Partial` is what
@@ -2353,7 +2410,8 @@ impl ServerSession {
         //    OTP prompt the caller queued, plus the URL in the instructions.
         //    Owned here rather than delegated to the manual round, because
         //    delegating would mean `subscribe()` never happens.
-        if kinds.contains(&CredentialKind::Totp) {
+        if totp_outstanding {
+            // The budget for this wait was charged above.
             // Subscribed on the state itself: at v0.28.6 the change signal lives
             // on `AuthState`, not in a store-wide map, and sends happen under
             // the state's own lock — so subscribing here cannot miss a
@@ -2388,28 +2446,7 @@ impl ServerSession {
         //    while the carried receiver still points at the old channel. The
         //    mismatched wait is dropped here and a new one starts at round 1.
         let Some(mut wait) = wait_for_state(pending_wait, &identification_string) else {
-            // Charged on wait *creation* only, never per round: a per-round
-            // increment against a cap of 3 would reject real users after roughly
-            // 30 s, make the configured budget unreachable and turn the farewell
-            // path into dead code. The count lives on `ServerSession`, so a
-            // client alternating usernames to force this discard path inherits
-            // it rather than resetting it.
-            let (used, capped) = bump_waits(self.web_auth_waits_used);
-            self.web_auth_waits_used = used;
-            if capped {
-                warn!(
-                    waits_used = used,
-                    "Too many browser-approval waits on this connection"
-                );
-                // Deliberately no `self.auth_state = None`: keeping
-                // `get_auth_state`'s memoization means a capped client stops
-                // allocating auth states, each of which the store retains for
-                // ten minutes.
-                return Ok(WebApprovalRoundOutcome::Return(
-                    russh::server::Auth::reject(),
-                ));
-            }
-
+            // The budget for this wait was charged above.
             let receiver = auth_state.lock().await.subscribe();
             let instructions = self.web_auth_instructions(auth_state).await;
 
