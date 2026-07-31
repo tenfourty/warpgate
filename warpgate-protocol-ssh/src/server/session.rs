@@ -207,53 +207,6 @@ const fn web_approval_proves_step_up(approval_present: bool, approval_was_bypass
     approval_present && !approval_was_bypassed
 }
 
-#[cfg(test)]
-mod tests {
-    use russh::{MethodKind, MethodSet};
-
-    use super::reject_with_allowed_auth_methods;
-
-    #[test]
-    fn rejected_public_key_auth_advertises_only_configured_methods() {
-        let configured_methods = MethodSet::from(&[MethodKind::PublicKey][..]);
-        let auth = reject_with_allowed_auth_methods(configured_methods.clone());
-
-        let russh::server::Auth::Reject {
-            proceed_with_methods: Some(advertised_methods),
-            ..
-        } = auth
-        else {
-            panic!("expected an authentication rejection with advertised methods");
-        };
-
-        assert_eq!(advertised_methods, configured_methods);
-        assert!(!advertised_methods.contains(&MethodKind::Password));
-        assert!(!advertised_methods.contains(&MethodKind::KeyboardInteractive));
-    }
-
-    /// The step-up gate and the `last_sso_at` stamp must both refuse an
-    /// approval that the grace-period bypass injected. Otherwise a user whose
-    /// credential policy lists `WebUserApproval` re-stamps `last_sso_at` on
-    /// every reconnect inside `web_approval_grace_period_seconds`, and the
-    /// step-up interval never fires again.
-    #[test]
-    fn a_bypassed_web_approval_neither_satisfies_step_up_nor_stamps_last_sso_at() {
-        // A real approval collected by this attempt: gate satisfied, stamp taken.
-        assert!(super::web_approval_proves_step_up(true, false));
-
-        // The same credential, injected by the grace-period bypass: neither.
-        assert!(
-            !super::web_approval_proves_step_up(true, true),
-            "a grace-period bypass must not count as a step-up handshake, or \
-             last_sso_at is re-stamped on every reconnect inside the window"
-        );
-
-        // No approval at all: the gate falls through to the freshness read.
-        assert!(!super::web_approval_proves_step_up(false, false));
-        assert!(!super::web_approval_proves_step_up(false, true));
-    }
-}
-
 impl std::fmt::Debug for ServerSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", session_debug_tag(&self.id, &self.remote_address))
@@ -2723,5 +2676,191 @@ impl Future for PendingCommand {
             },
             Self::Failed => Poll::Ready(Err(SshClientError::MpscError)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::time::{Duration, Instant};
+
+    use russh::{MethodKind, MethodSet};
+    use uuid::Uuid;
+    use warpgate_common::auth::{AuthResult, AuthStateUserInfo, CredentialKind};
+
+    use super::{WebAuthStep, next_web_auth_step, reject_with_allowed_auth_methods};
+
+    #[test]
+    fn rejected_public_key_auth_advertises_only_configured_methods() {
+        let configured_methods = MethodSet::from(&[MethodKind::PublicKey][..]);
+        let auth = reject_with_allowed_auth_methods(configured_methods.clone());
+
+        let russh::server::Auth::Reject {
+            proceed_with_methods: Some(advertised_methods),
+            ..
+        } = auth
+        else {
+            panic!("expected an authentication rejection with advertised methods");
+        };
+
+        assert_eq!(advertised_methods, configured_methods);
+        assert!(!advertised_methods.contains(&MethodKind::Password));
+        assert!(!advertised_methods.contains(&MethodKind::KeyboardInteractive));
+    }
+
+    /// The step-up gate and the `last_sso_at` stamp must both refuse an
+    /// approval that the grace-period bypass injected. Otherwise a user whose
+    /// credential policy lists `WebUserApproval` re-stamps `last_sso_at` on
+    /// every reconnect inside `web_approval_grace_period_seconds`, and the
+    /// step-up interval never fires again.
+    #[test]
+    fn a_bypassed_web_approval_neither_satisfies_step_up_nor_stamps_last_sso_at() {
+        // A real approval collected by this attempt: gate satisfied, stamp taken.
+        assert!(super::web_approval_proves_step_up(true, false));
+
+        // The same credential, injected by the grace-period bypass: neither.
+        assert!(
+            !super::web_approval_proves_step_up(true, true),
+            "a grace-period bypass must not count as a step-up handshake, or \
+             last_sso_at is re-stamped on every reconnect inside the window"
+        );
+
+        // No approval at all: the gate falls through to the freshness read.
+        assert!(!super::web_approval_proves_step_up(false, false));
+        assert!(!super::web_approval_proves_step_up(false, true));
+    }
+
+    fn accepted() -> AuthResult {
+        AuthResult::Accepted {
+            user_info: AuthStateUserInfo {
+                id: Uuid::nil(),
+                username: "someone".to_owned(),
+            },
+        }
+    }
+
+    fn need_web_approval() -> AuthResult {
+        AuthResult::Need(
+            [CredentialKind::WebUserApproval]
+                .into_iter()
+                .collect::<HashSet<_>>(),
+        )
+    }
+
+    /// I2: an `Accepted` verdict is the only thing that accepts, and it does so
+    /// unconditionally.
+    #[test]
+    fn unit_web_auth_accepted_verdict_accepts() {
+        let now = Instant::now();
+        assert_eq!(
+            next_web_auth_step(now, Some(now + Duration::from_secs(60)), true, &accepted()),
+            WebAuthStep::Accept
+        );
+    }
+
+    /// Accept wins over an expired budget: by the time a verdict of `Accepted`
+    /// exists, `_auth_accept`, `complete()` and the `last_sso_at` stamp have
+    /// already run, so rejecting on a stale deadline would discard a completed
+    /// authentication.
+    #[test]
+    fn unit_web_auth_accepted_beats_expired_deadline() {
+        let now = Instant::now();
+        assert_eq!(
+            next_web_auth_step(now, Some(now - Duration::from_secs(1)), true, &accepted()),
+            WebAuthStep::Accept
+        );
+    }
+
+    /// I2: the browser-reject sequence — `api_reject_auth` fires the same wake
+    /// signal as an approval, so a `Rejected` verdict must reject at once
+    /// rather than waiting out the budget.
+    #[test]
+    fn unit_web_auth_rejected_verdict_rejects_immediately() {
+        let now = Instant::now();
+        assert_eq!(
+            next_web_auth_step(
+                now,
+                Some(now + Duration::from_secs(60)),
+                true,
+                &AuthResult::Rejected
+            ),
+            WebAuthStep::Reject { message: None }
+        );
+    }
+
+    /// First zero-prompt round with budget left: poll again, carrying the URL.
+    #[test]
+    fn unit_web_auth_need_first_round_includes_url() {
+        let now = Instant::now();
+        assert_eq!(
+            next_web_auth_step(
+                now,
+                Some(now + Duration::from_secs(60)),
+                false,
+                &need_web_approval()
+            ),
+            WebAuthStep::PollAgain { include_url: true }
+        );
+    }
+
+    /// I5 / SC2: once the URL has been shown, later rounds must suppress it —
+    /// PuTTY and Paramiko print the instruction field on every round.
+    #[test]
+    fn unit_web_auth_need_later_round_suppresses_url() {
+        let now = Instant::now();
+        assert_eq!(
+            next_web_auth_step(
+                now,
+                Some(now + Duration::from_secs(60)),
+                true,
+                &need_web_approval()
+            ),
+            WebAuthStep::PollAgain { include_url: false }
+        );
+    }
+
+    /// A deadline that has not been set yet (the first zero-prompt round has
+    /// not happened) can never expire.
+    #[test]
+    fn unit_web_auth_need_without_deadline_polls_again() {
+        let now = Instant::now();
+        assert_eq!(
+            next_web_auth_step(now, None, false, &need_web_approval()),
+            WebAuthStep::PollAgain { include_url: true }
+        );
+    }
+
+    /// SC3: budget expiry rejects, and carries the not-confirmed text so it can
+    /// be delivered in a farewell round (`Auth::Reject` has no message field).
+    #[test]
+    fn unit_web_auth_need_expired_deadline_rejects_with_message() {
+        let now = Instant::now();
+        let step = next_web_auth_step(
+            now,
+            Some(now - Duration::from_secs(1)),
+            true,
+            &need_web_approval(),
+        );
+        let WebAuthStep::Reject {
+            message: Some(message),
+        } = step
+        else {
+            panic!("expected a Reject carrying a message, got {step:?}");
+        };
+        assert!(
+            message.contains("not confirmed"),
+            "farewell message should carry the not-confirmed text, got {message:?}"
+        );
+    }
+
+    /// Exact boundary: `now == deadline` is expired, matching the `now >= deadline`
+    /// test in the spec algorithm.
+    #[test]
+    fn unit_web_auth_need_exact_boundary_deadline_rejects() {
+        let now = Instant::now();
+        assert!(matches!(
+            next_web_auth_step(now, Some(now), true, &need_web_approval()),
+            WebAuthStep::Reject { message: Some(_) }
+        ));
     }
 }
