@@ -2517,10 +2517,14 @@ mod tests {
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
 
+    use tokio::sync::broadcast;
     use uuid::Uuid;
     use warpgate_common::auth::{AuthResult, AuthStateUserInfo, CredentialKind};
 
-    use super::{WebAuthStep, next_web_auth_step};
+    use super::{
+        PendingKeyboardInteractiveAuth, WebApprovalWait, WebAuthStep, carry_forward,
+        next_web_auth_step,
+    };
 
     fn accepted() -> AuthResult {
         AuthResult::Accepted {
@@ -2537,6 +2541,45 @@ mod tests {
                 .into_iter()
                 .collect::<HashSet<_>>(),
         )
+    }
+
+    /// I4: the wait — and therefore its live broadcast receiver — has to survive
+    /// being carried from one keyboard-interactive round to the next. The naive
+    /// implementation drops the receiver every round, so there are zero
+    /// subscribers at the moment `complete()` sends, `send()` returns `Err`,
+    /// warpgate discards it, and approval is only noticed at the next tick.
+    #[tokio::test]
+    async fn unit_web_auth_wait_receiver_survives_a_round() {
+        let (sender, _) = broadcast::channel::<AuthResult>(1);
+        let previous = PendingKeyboardInteractiveAuth {
+            otp_prompt_sent: true,
+            web_approval_retry_count: None,
+            web_approval_wait: Some(WebApprovalWait {
+                receiver: Some(sender.subscribe()),
+                state_id: Uuid::nil(),
+                deadline: None,
+                round: 1,
+                url_shown: true,
+                farewell: false,
+            }),
+        };
+
+        let next = carry_forward(previous);
+
+        let carried = next
+            .web_approval_wait
+            .expect("the wait must be carried into the next round");
+        let mut receiver = carried
+            .receiver
+            .expect("the carried wait must still hold its receiver");
+
+        sender
+            .send(accepted())
+            .expect("the carried receiver must still be subscribed");
+        assert!(matches!(
+            receiver.recv().await,
+            Ok(AuthResult::Accepted { .. })
+        ));
     }
 
     /// I2: an `Accepted` verdict is the only thing that accepts, and it does so
