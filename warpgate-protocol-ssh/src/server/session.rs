@@ -2459,3 +2459,148 @@ impl Future for PendingCommand {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::time::{Duration, Instant};
+
+    use uuid::Uuid;
+    use warpgate_common::auth::{AuthResult, AuthStateUserInfo, CredentialKind};
+
+    use super::{WebAuthStep, next_web_auth_step};
+
+    fn accepted() -> AuthResult {
+        AuthResult::Accepted {
+            user_info: AuthStateUserInfo {
+                id: Uuid::nil(),
+                username: "someone".to_owned(),
+            },
+        }
+    }
+
+    fn need_web_approval() -> AuthResult {
+        AuthResult::Need(
+            [CredentialKind::WebUserApproval]
+                .into_iter()
+                .collect::<HashSet<_>>(),
+        )
+    }
+
+    /// I2: an `Accepted` verdict is the only thing that accepts, and it does so
+    /// unconditionally.
+    #[test]
+    fn unit_web_auth_accepted_verdict_accepts() {
+        let now = Instant::now();
+        assert_eq!(
+            next_web_auth_step(now, Some(now + Duration::from_secs(60)), true, &accepted()),
+            WebAuthStep::Accept
+        );
+    }
+
+    /// Accept wins over an expired budget: by the time a verdict of `Accepted`
+    /// exists, `_auth_accept`, `complete()` and the `last_sso_at` stamp have
+    /// already run, so rejecting on a stale deadline would discard a completed
+    /// authentication.
+    #[test]
+    fn unit_web_auth_accepted_beats_expired_deadline() {
+        let now = Instant::now();
+        assert_eq!(
+            next_web_auth_step(now, Some(now - Duration::from_secs(1)), true, &accepted()),
+            WebAuthStep::Accept
+        );
+    }
+
+    /// I2: the browser-reject sequence — `api_reject_auth` fires the same wake
+    /// signal as an approval, so a `Rejected` verdict must reject at once
+    /// rather than waiting out the budget.
+    #[test]
+    fn unit_web_auth_rejected_verdict_rejects_immediately() {
+        let now = Instant::now();
+        assert_eq!(
+            next_web_auth_step(
+                now,
+                Some(now + Duration::from_secs(60)),
+                true,
+                &AuthResult::Rejected
+            ),
+            WebAuthStep::Reject { message: None }
+        );
+    }
+
+    /// First zero-prompt round with budget left: poll again, carrying the URL.
+    #[test]
+    fn unit_web_auth_need_first_round_includes_url() {
+        let now = Instant::now();
+        assert_eq!(
+            next_web_auth_step(
+                now,
+                Some(now + Duration::from_secs(60)),
+                false,
+                &need_web_approval()
+            ),
+            WebAuthStep::PollAgain { include_url: true }
+        );
+    }
+
+    /// I5 / SC2: once the URL has been shown, later rounds must suppress it —
+    /// PuTTY and Paramiko print the instruction field on every round.
+    #[test]
+    fn unit_web_auth_need_later_round_suppresses_url() {
+        let now = Instant::now();
+        assert_eq!(
+            next_web_auth_step(
+                now,
+                Some(now + Duration::from_secs(60)),
+                true,
+                &need_web_approval()
+            ),
+            WebAuthStep::PollAgain { include_url: false }
+        );
+    }
+
+    /// A deadline that has not been set yet (the first zero-prompt round has
+    /// not happened) can never expire.
+    #[test]
+    fn unit_web_auth_need_without_deadline_polls_again() {
+        let now = Instant::now();
+        assert_eq!(
+            next_web_auth_step(now, None, false, &need_web_approval()),
+            WebAuthStep::PollAgain { include_url: true }
+        );
+    }
+
+    /// SC3: budget expiry rejects, and carries the not-confirmed text so it can
+    /// be delivered in a farewell round (`Auth::Reject` has no message field).
+    #[test]
+    fn unit_web_auth_need_expired_deadline_rejects_with_message() {
+        let now = Instant::now();
+        let step = next_web_auth_step(
+            now,
+            Some(now - Duration::from_secs(1)),
+            true,
+            &need_web_approval(),
+        );
+        let WebAuthStep::Reject {
+            message: Some(message),
+        } = step
+        else {
+            panic!("expected a Reject carrying a message, got {step:?}");
+        };
+        assert!(
+            message.contains("not confirmed"),
+            "farewell message should carry the not-confirmed text, got {message:?}"
+        );
+    }
+
+    /// Exact boundary: `now == deadline` is expired, matching the `now >= deadline`
+    /// test in the spec algorithm.
+    #[test]
+    fn unit_web_auth_need_exact_boundary_deadline_rejects() {
+        let now = Instant::now();
+        assert!(matches!(
+            next_web_auth_step(now, Some(now), true, &need_web_approval()),
+            WebAuthStep::Reject { message: Some(_) }
+        ));
+    }
+}
