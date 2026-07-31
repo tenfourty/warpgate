@@ -10,7 +10,7 @@ use defaults::{
     _default_http_listen, _default_kubernetes_listen, _default_mysql_advertised_version,
     _default_mysql_listen, _default_postgres_listen, _default_recordings_path, _default_retention,
     _default_session_max_age, _default_ssh_inactivity_timeout, _default_ssh_keys_path,
-    _default_ssh_listen,
+    _default_ssh_listen, _default_web_auth_wait_timeout,
 };
 use poem_openapi::{Object, Union};
 use schemars::JsonSchema;
@@ -301,6 +301,13 @@ pub struct SshConfig {
     #[serde(default)]
     pub keepalive_interval: Option<Duration>,
 
+    #[serde(default)]
+    pub web_auth_auto_continue: bool,
+
+    #[serde(default = "_default_web_auth_wait_timeout", with = "humantime_serde")]
+    #[schemars(with = "String")]
+    pub web_auth_wait_timeout: Duration,
+
     /// Default SSH target name when no target is specified (e.g., `ssh warpgate` instead of `ssh user:target@warpgate`)
     #[serde(default)]
     pub default_target: Option<String>,
@@ -317,6 +324,8 @@ impl Default for SshConfig {
             external_host: None,
             inactivity_timeout: _default_ssh_inactivity_timeout(),
             keepalive_interval: None,
+            web_auth_auto_continue: false,
+            web_auth_wait_timeout: _default_web_auth_wait_timeout(),
             default_target: None,
         }
     }
