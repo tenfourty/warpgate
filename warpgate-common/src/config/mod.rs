@@ -12,6 +12,7 @@ use defaults::{
     _default_mysql_listen, _default_postgres_listen, _default_rdp_listen, _default_recordings_path,
     _default_retention, _default_session_max_age, _default_ssh_inactivity_timeout,
     _default_ssh_keys_path, _default_ssh_listen, _default_vnc_listen,
+    _default_web_auth_wait_timeout,
 };
 use poem_openapi::{Object, Union};
 use schemars::JsonSchema;
@@ -444,6 +445,17 @@ pub struct SshConfig {
     #[schemars(with = "Option<String>")]
     pub keepalive_interval: Option<Duration>,
 
+    /// Complete the SSH browser-approval round without a `Press Enter` prompt,
+    /// by polling the auth state across zero-prompt keyboard-interactive rounds.
+    #[serde(default)]
+    pub web_auth_auto_continue: bool,
+
+    /// How long one connection may keep polling for a browser approval before
+    /// the attempt is rejected.
+    #[serde(default = "_default_web_auth_wait_timeout", with = "humantime_serde")]
+    #[schemars(with = "String")]
+    pub web_auth_wait_timeout: Duration,
+
     /// Default SSH target name when no target is specified (e.g., `ssh warpgate` instead of `ssh user:target@warpgate`)
     #[serde(default)]
     pub default_target: Option<String>,
@@ -461,6 +473,8 @@ impl Default for SshConfig {
             external_host: None,
             inactivity_timeout: _default_ssh_inactivity_timeout(),
             keepalive_interval: None,
+            web_auth_auto_continue: false,
+            web_auth_wait_timeout: _default_web_auth_wait_timeout(),
             default_target: None,
         }
     }
