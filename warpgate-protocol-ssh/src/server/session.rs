@@ -118,7 +118,6 @@ struct WebApprovalWait {
 
 struct PendingKeyboardInteractiveAuth {
     otp_prompt_sent: bool,
-    web_approval_retry_count: Option<u8>,
     web_approval_wait: Option<WebApprovalWait>,
 }
 
@@ -126,10 +125,35 @@ impl PendingKeyboardInteractiveAuth {
     const fn fresh() -> Self {
         Self {
             otp_prompt_sent: false,
-            web_approval_retry_count: None,
             web_approval_wait: None,
         }
     }
+}
+
+/// How many browser-approval waits one TCP connection may start.
+///
+/// This is the **only** bound on a keyboard-interactive web-approval round —
+/// both the auto-continue path (where a wait is a live broadcast subscription)
+/// and the manual Press-Enter path (where the wait is the human) are charged
+/// against it. There is deliberately no second, per-round counter: one lived on
+/// `PendingKeyboardInteractiveAuth`, which is dropped by every terminal return,
+/// so it reset whenever it mattered.
+///
+/// This is the server-owned bound. The client's `number_of_password_prompts` is
+/// not a control we own, and russh's `max_auth_attempts` is a dead field —
+/// declared and defaulted, but nothing in the crate enforces it.
+const MAX_WEB_AUTH_WAITS: u8 = 3;
+
+/// Charge one wait against the per-connection budget, returning the new count
+/// and whether the cap has been exceeded.
+///
+/// Increment-before-compare is deliberate: it permits exactly
+/// [`MAX_WEB_AUTH_WAITS`] waits and rejects at the start of the next one. The
+/// add saturates because post-cap attempts keep incrementing before they are
+/// rejected, and a wrapping `u8` would silently hand the client a fresh budget.
+const fn bump_waits(used: u8) -> (u8, bool) {
+    let used = used.saturating_add(1);
+    (used, used > MAX_WEB_AUTH_WAITS)
 }
 
 /// Consume the previous round's pending state and produce this round's, moving
@@ -142,7 +166,6 @@ impl PendingKeyboardInteractiveAuth {
 fn carry_forward(previous: PendingKeyboardInteractiveAuth) -> PendingKeyboardInteractiveAuth {
     PendingKeyboardInteractiveAuth {
         otp_prompt_sent: false,
-        web_approval_retry_count: None,
         web_approval_wait: previous.web_approval_wait,
     }
 }
@@ -212,6 +235,17 @@ pub struct ServerSession {
     host_key_trust_prompt_active: Arc<AtomicBool>,
     /// Track the state of a client snooping around pre-auth
     probe: ProbeState,
+    /// Browser-approval waits started on this connection, on either the
+    /// auto-continue or the manual Press-Enter path.
+    ///
+    /// This lives here, not on `PendingKeyboardInteractiveAuth`, because that
+    /// struct is re-stored only on the `Auth::Partial` path and dropped by every
+    /// terminal return — a counter there would reset on the next
+    /// keyboard-interactive attempt and the cap could never fire. `ServerSession`
+    /// is constructed once per accepted TCP stream and dies with the connection,
+    /// so the count survives `self.auth_state = None`, every terminal reject, and
+    /// any number of fresh `USERAUTH_REQUEST`s.
+    web_auth_waits_used: u8,
 }
 
 fn session_debug_tag(id: &SessionId, remote_address: &SocketAddr) -> String {
@@ -367,6 +401,7 @@ impl ServerSession {
             allowed_auth_methods: get_allowed_auth_methods(services).await?,
             host_key_trust_prompt_active: Arc::new(AtomicBool::new(false)),
             probe: ProbeState::NoAttempt,
+            web_auth_waits_used: 0,
         };
 
         let mut so_rx = this.service_output.subscribe();
@@ -2148,9 +2183,6 @@ impl ServerSession {
         } else {
             None
         };
-        let pending_web_auth_retries = keyboard_interactive_state
-            .as_ref()
-            .and_then(|s| s.web_approval_retry_count);
         // Destructure the taken struct exactly once and move its carried fields
         // forward, so an in-flight wait's broadcast receiver is not dropped at
         // the start of every round.
@@ -2164,6 +2196,24 @@ impl ServerSession {
                 let mut auth_name = "Warpgate authentication".to_string();
                 let mut auth_instructions = String::new();
                 let mut auth_prompts = vec![];
+
+                // Charged before anything borrows `self`, and before any
+                // auth-state work, so a capped client stops allocating. One
+                // counter governs the round; see `MAX_WEB_AUTH_WAITS`.
+                let mut web_approval_is_retry = false;
+                if kinds.contains(&CredentialKind::WebUserApproval) {
+                    web_approval_is_retry = self.web_auth_waits_used > 0;
+                    let (used, capped) = bump_waits(self.web_auth_waits_used);
+                    self.web_auth_waits_used = used;
+                    if capped {
+                        warn!(
+                            waits_used = used,
+                            "Too many browser-approval waits on this connection"
+                        );
+                        self.auth_state = None;
+                        return Ok(russh::server::Auth::reject());
+                    }
+                }
 
                 let Some((auth_state, _)) = self.auth_state.as_ref() else {
                     return Ok(russh::server::Auth::Reject {
@@ -2200,21 +2250,8 @@ impl ServerSession {
                     ));
                     auth_prompts.push(("Press Enter when done: ".into(), true));
 
-                    #[allow(clippy::items_after_statements)]
-                    const MAX_RETRIES: u8 = 3;
-                    if let Some(retries) = pending_web_auth_retries {
-                        if retries >= MAX_RETRIES {
-                            drop(auth_state);
-                            self.auth_state = None;
-                            return Ok(russh::server::Auth::reject());
-                        }
-
-                        auth_instructions.push_str(
-                            "\n[!] Browser authentication was not confirmed, please try again.\n",
-                        );
-                        next_pending.web_approval_retry_count = Some(retries + 1);
-                    } else {
-                        next_pending.web_approval_retry_count = Some(0);
+                    if web_approval_is_retry {
+                        auth_instructions.push_str(WEB_AUTH_NOT_CONFIRMED_MESSAGE);
                     }
                 }
 
@@ -2889,7 +2926,6 @@ mod tests {
         let (sender, _) = broadcast::channel::<AuthResult>(1);
         let previous = PendingKeyboardInteractiveAuth {
             otp_prompt_sent: true,
-            web_approval_retry_count: None,
             web_approval_wait: Some(WebApprovalWait {
                 receiver: Some(sender.subscribe()),
                 state_id: Uuid::nil(),
