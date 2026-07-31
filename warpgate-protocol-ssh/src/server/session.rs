@@ -102,10 +102,13 @@ struct WebApprovalWait {
     /// be dropped — a `select!` on a permanently-closed receiver returns
     /// instantly and would spin rounds at client RTT.
     receiver: Option<broadcast::Receiver<AuthResult>>,
-    /// The auth state this wait is bound to. A round whose current state id
-    /// differs discards the wait, so one principal's approval can never wake
-    /// another principal's session.
-    state_id: Uuid,
+    /// Identifies the auth state this wait is bound to. `AuthState` carries no
+    /// id of its own at v0.28.6, so the wait is keyed on the security key the
+    /// state generates for itself — freshly random per state, and the very
+    /// string the user is asked to match in the browser. A round whose current
+    /// state shows a different key discards the wait, so one principal's
+    /// approval can never wake another principal's session.
+    identification_string: String,
     /// Budget expiry, set lazily at the first zero-prompt round so that time
     /// spent typing an OTP does not eat the SSO budget.
     deadline: Option<Instant>,
@@ -293,6 +296,17 @@ fn reject_with_allowed_auth_methods(allowed_auth_methods: MethodSet) -> russh::s
 const fn web_approval_proves_step_up(approval_present: bool, approval_was_bypassed: bool) -> bool {
     approval_present && !approval_was_bypassed
 }
+
+/// How long one auto-continue round waits before handing a packet back to the
+/// client.
+///
+/// A server→client packet has to cross the wire well inside the client's
+/// read deadline — an `ServerAliveInterval 30` × `ServerAliveCountMax 3` client
+/// gives a 90 s ceiling — and russh cannot emit anything while an auth handler
+/// future is pending. Keeping each wait short is also what bounds how long the
+/// session's serialized event loop is held, so `Close` and `Disconnect` are
+/// serviced within one round.
+const WEB_AUTH_POLL_CADENCE: Duration = Duration::from_secs(10);
 
 /// Text shown when the browser approval never arrived within the budget. It has
 /// to travel in a final zero-prompt `Auth::Partial`, because `Auth::Reject`
@@ -2285,6 +2299,19 @@ impl ServerSession {
     }
 
     /// Auto-continue web-approval round (`ssh.web_auth_auto_continue` on).
+    ///
+    /// Each round is one keyboard-interactive exchange. RFC 4256 §3.2 permits
+    /// `num-prompts == 0` and §3.4 *requires* the client to answer with a
+    /// zero-response message, so the client auto-acknowledges with no user
+    /// interaction and hands the server a fresh round to work with. That is the
+    /// whole point of this path: an AI agent or any other non-interactive SSH
+    /// client never has to answer a `Press Enter when done: ` prompt.
+    ///
+    /// The four blocks below are mutually exclusive and each ends in a return.
+    /// Read as sequential `if`s instead, the TOTP-plus-web case would fall out
+    /// of the TOTP block into the new-wait test, find a matching wait and emit a
+    /// zero-prompt round *instead of* the OTP prompt — so those users could
+    /// never log in at all.
     #[allow(clippy::too_many_arguments)]
     async fn web_approval_round_auto(
         &mut self,
@@ -2296,10 +2323,236 @@ impl ServerSession {
         auth_prompts: &mut Vec<(Cow<'static, str>, bool)>,
         next_pending: &mut PendingKeyboardInteractiveAuth,
     ) -> Result<WebApprovalRoundOutcome> {
-        let _ = (selector, kinds, &*auth_name, next_pending);
-        Ok(self
-            .web_approval_round_manual(auth_state, auth_instructions, auth_prompts)
-            .await)
+        let pending_wait = next_pending.web_approval_wait.take();
+        // Copied out so no `AuthState` guard is alive past this statement.
+        let identification_string = auth_state.lock().await.identification_string().to_owned();
+
+        // 1. The not-confirmed message went out last round. Reject now, on the
+        //    client's automatic empty response. Emitting no `Partial` is what
+        //    stops this looping.
+        if pending_wait.as_ref().is_some_and(|wait| wait.farewell) {
+            return Ok(WebApprovalRoundOutcome::Return(
+                russh::server::Auth::reject(),
+            ));
+        }
+
+        // 2. TOTP is still outstanding, so this round keeps today's shape: the
+        //    OTP prompt the caller queued, plus the URL in the instructions.
+        //    Owned here rather than delegated to the manual round, because
+        //    delegating would mean `subscribe()` never happens.
+        if kinds.contains(&CredentialKind::Totp) {
+            // Subscribed on the state itself: at v0.28.6 the change signal lives
+            // on `AuthState`, not in a store-wide map, and sends happen under
+            // the state's own lock — so subscribing here cannot miss a
+            // transition and no signal entry is left behind to be vacuumed.
+            let receiver = auth_state.lock().await.subscribe();
+            let instructions = self.web_auth_instructions(auth_state).await;
+
+            auth_instructions.push_str(&instructions);
+            next_pending.web_approval_wait = Some(WebApprovalWait {
+                receiver: Some(receiver),
+                identification_string: identification_string.clone(),
+                // Left unset: the budget starts at the first zero-prompt round,
+                // so time spent typing the OTP does not eat it.
+                deadline: None,
+                round: 1,
+                // This round printed the URL, so the first zero-prompt round
+                // must suppress it or it goes out twice.
+                url_shown: true,
+                farewell: false,
+            });
+
+            return Ok(self.emit_round(
+                std::mem::take(auth_name),
+                std::mem::take(auth_instructions),
+                std::mem::take(auth_prompts),
+                next_pending,
+            ));
+        }
+
+        // 3. No wait yet, or the carried one belongs to a different principal —
+        //    `get_auth_state` mints a new `AuthState` when the username changes,
+        //    while the carried receiver still points at the old channel. The
+        //    mismatched wait is dropped here and a new one starts at round 1.
+        let Some(mut wait) =
+            pending_wait.filter(|wait| wait.identification_string == identification_string)
+        else {
+            // Charged on wait *creation* only, never per round: a per-round
+            // increment against a cap of 3 would reject real users after roughly
+            // 30 s, make the configured budget unreachable and turn the farewell
+            // path into dead code. The count lives on `ServerSession`, so a
+            // client alternating usernames to force this discard path inherits
+            // it rather than resetting it.
+            let (used, capped) = bump_waits(self.web_auth_waits_used);
+            self.web_auth_waits_used = used;
+            if capped {
+                warn!(
+                    waits_used = used,
+                    "Too many browser-approval waits on this connection"
+                );
+                // Deliberately no `self.auth_state = None`: keeping
+                // `get_auth_state`'s memoization means a capped client stops
+                // allocating auth states, each of which the store retains for
+                // ten minutes.
+                return Ok(WebApprovalRoundOutcome::Return(
+                    russh::server::Auth::reject(),
+                ));
+            }
+
+            let receiver = auth_state.lock().await.subscribe();
+            let instructions = self.web_auth_instructions(auth_state).await;
+
+            auth_instructions.push_str(&instructions);
+            next_pending.web_approval_wait = Some(WebApprovalWait {
+                receiver: Some(receiver),
+                identification_string,
+                deadline: None,
+                round: 1,
+                url_shown: true,
+                farewell: false,
+            });
+
+            return Ok(self.emit_round(
+                std::mem::take(auth_name),
+                std::mem::take(auth_instructions),
+                // Zero prompts, and returning the reply from here is what keeps
+                // it away from the caller's `auth_prompts.is_empty()` branch,
+                // which rejects.
+                std::mem::take(auth_prompts),
+                next_pending,
+            ));
+        };
+
+        // 4. Rounds 2..N: wait for the approval, then re-evaluate.
+        //
+        //    Nothing may be held across the wait — no mutex guard and no borrow
+        //    of `self`. Awaiting inside the `AuthState` guard would block the
+        //    browser's approve POST on the very lock this round is waiting for,
+        //    and because the approve path takes the global `auth_state_store`
+        //    lock while reaching for the per-state lock, one waiting SSH session
+        //    would freeze SSH, HTTP, MySQL and Postgres auth gateway-wide.
+        let web_auth_wait_timeout = self
+            .services
+            .config
+            .lock()
+            .await
+            .store
+            .ssh
+            .web_auth_wait_timeout;
+
+        let deadline = wait
+            .deadline
+            .unwrap_or_else(|| Instant::now() + web_auth_wait_timeout);
+        wait.deadline = Some(deadline);
+
+        // Clamped so a round never overruns the budget.
+        let sleep_for =
+            WEB_AUTH_POLL_CADENCE.min(deadline.saturating_duration_since(Instant::now()));
+
+        // The signal is only an early-wake optimisation — the auth state is the
+        // source of truth. A lost signal costs at most one round of latency,
+        // never a hang and never a wrong verdict.
+        match wait.receiver.as_mut() {
+            Some(receiver) => {
+                tokio::select! {
+                    signal = receiver.recv() => {
+                        if matches!(signal, Err(broadcast::error::RecvError::Closed)) {
+                            // A closed receiver returns instantly from `select!`
+                            // on every later round — spinning rounds at client
+                            // RTT. Drop it and fall through to a plain clamped
+                            // sleep. Nothing is lost: broadcast delivers a
+                            // buffered value before reporting `Closed`, and the
+                            // verdict below reads the state regardless.
+                            // `Lagged` deliberately falls through instead: it
+                            // means a transition was missed, and re-verifying is
+                            // exactly the right response.
+                            wait.receiver = None;
+                        }
+                    }
+                    () = tokio::time::sleep(sleep_for) => {}
+                }
+            }
+            None => tokio::time::sleep(sleep_for).await,
+        }
+
+        // Authoritative. The completion signal fires on a browser *rejection*
+        // too, so being woken is not evidence of approval — only this verdict
+        // can accept. Re-running the real path also keeps the `last_sso_at`
+        // stamp exactly as it is today.
+        let verdict = self.try_auth_lazy(selector, None).await?;
+
+        match next_web_auth_step(Instant::now(), Some(deadline), wait.url_shown, &verdict) {
+            WebAuthStep::Accept => Ok(WebApprovalRoundOutcome::Return(russh::server::Auth::Accept)),
+            WebAuthStep::Reject { message: None } => Ok(WebApprovalRoundOutcome::Return(
+                russh::server::Auth::reject(),
+            )),
+            WebAuthStep::Reject {
+                message: Some(message),
+            } => {
+                // Two rounds, because `Auth::Reject` has no text field: the
+                // message travels in a final zero-prompt `Partial` and block 1
+                // rejects the client's automatic empty response.
+                wait.farewell = true;
+                next_pending.web_approval_wait = Some(wait);
+                Ok(self.emit_round(String::new(), message, vec![], next_pending))
+            }
+            WebAuthStep::PollAgain { include_url } => {
+                let instructions = if include_url {
+                    self.web_auth_instructions(auth_state).await
+                } else {
+                    // Empty name and instructions: OpenSSH prints neither when
+                    // they are empty, while PuTTY and Paramiko print the
+                    // instruction field on *every* round — so a repeated URL
+                    // would be printed once per round.
+                    String::new()
+                };
+                wait.round = wait.round.saturating_add(1);
+                wait.url_shown = true;
+                next_pending.web_approval_wait = Some(wait);
+                Ok(self.emit_round(String::new(), instructions, vec![], next_pending))
+            }
+        }
+    }
+
+    /// Build the browser-approval instructions block, with the login URL when
+    /// one can be constructed.
+    ///
+    /// Every guard it takes is released before it returns, so it is safe to call
+    /// on either side of a round wait — but never during one.
+    async fn web_auth_instructions(&self, auth_state: &Arc<Mutex<AuthState>>) -> String {
+        let identification_string = auth_state.lock().await.identification_string().to_owned();
+
+        let ext_url = construct_external_url(None, &*self.services.config.lock().await, None)
+            .await
+            .inspect_err(|error| {
+                warn!(?error, "Failed to construct external URL");
+            })
+            .ok();
+
+        let auth_state = auth_state.lock().await;
+        let login_url = ext_url.map(|ext_url| auth_state.construct_web_approval_url(ext_url));
+
+        format_web_auth_instructions(login_url, &identification_string)
+    }
+
+    /// Store the pending state for the next round and emit the `Partial` that
+    /// carries it.
+    fn emit_round(
+        &mut self,
+        name: String,
+        instructions: String,
+        prompts: Vec<(Cow<'static, str>, bool)>,
+        next_pending: &mut PendingKeyboardInteractiveAuth,
+    ) -> WebApprovalRoundOutcome {
+        self.keyboard_interactive_state = Some(std::mem::replace(
+            next_pending,
+            PendingKeyboardInteractiveAuth::fresh(),
+        ));
+        WebApprovalRoundOutcome::Return(russh::server::Auth::Partial {
+            name: name.into(),
+            instructions: instructions.into(),
+            prompts: prompts.into(),
+        })
     }
 
     /// Today's Press-Enter web-approval round, behaviour unchanged.
@@ -3002,7 +3255,7 @@ mod tests {
             otp_prompt_sent: true,
             web_approval_wait: Some(WebApprovalWait {
                 receiver: Some(sender.subscribe()),
-                state_id: Uuid::nil(),
+                identification_string: "AAAA".to_owned(),
                 deadline: None,
                 round: 1,
                 url_shown: true,
