@@ -743,6 +743,12 @@ impl WarpgateConfig {
                 warn!("`step_up_interval.kubernetes` is set but no stamp caller is wired yet — cert auth will fail closed after the first interval until last_sso_at is hand-stamped or a kubectl OIDC flow is added.");
             }
         }
+        if self.store.ssh.web_auth_wait_timeout >= Duration::from_secs(600) {
+            warn!("`ssh.web_auth_wait_timeout` is set to >= 600s, which exceeds the `AuthStateStore` vacuum horizon of 10 minutes.");
+        }
+        if self.store.ssh.web_auth_auto_continue && self.store.ssh.web_auth_wait_timeout < Duration::from_secs(20) {
+            warn!("`ssh.web_auth_auto_continue` is enabled with `web_auth_wait_timeout` < 20s (less than twice the 10s poll cadence).");
+        }
     }
 }
 
@@ -750,7 +756,7 @@ impl WarpgateConfig {
 mod tests {
     use std::time::Duration;
 
-    use super::{SshConfig, StepUpIntervalConfig, WarpgateConfigStore};
+    use super::{SshConfig, StepUpIntervalConfig, WarpgateConfig, WarpgateConfigStore};
 
     #[test]
     fn unit_step_up_interval_default_is_none() {
@@ -820,5 +826,19 @@ step_up_interval: {}
         let config = SshConfig::default();
         assert_eq!(config.web_auth_auto_continue, false);
         assert_eq!(config.web_auth_wait_timeout, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn unit_web_auth_wait_timeout_high_parses_and_validates() {
+        // Verify that a 700s timeout parses and validate() does not panic
+        let yaml = r#"
+ssh:
+  enable: true
+  web_auth_wait_timeout: 700s
+"#;
+        let parsed: WarpgateConfigStore = serde_yaml::from_str(yaml).unwrap();
+        let config = WarpgateConfig { store: parsed };
+        // validate() should not panic even with high timeout
+        config.validate();
     }
 }
