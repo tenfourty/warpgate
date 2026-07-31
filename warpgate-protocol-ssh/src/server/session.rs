@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::hash_map::Entry::Vacant;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -298,6 +299,13 @@ const fn web_approval_proves_step_up(approval_present: bool, approval_was_bypass
 /// carries no message field.
 const WEB_AUTH_NOT_CONFIRMED_MESSAGE: &str =
     "\n[!] Browser authentication was not confirmed, please try again.\n";
+
+/// Whether a web-approval round has produced the whole `Auth` reply itself, or
+/// whether the caller should keep assembling one.
+enum WebApprovalRoundOutcome {
+    Continue,
+    Return(russh::server::Auth),
+}
 
 /// What an auto-continue web-approval round should do next.
 #[derive(Debug, PartialEq, Eq)]
@@ -2197,25 +2205,10 @@ impl ServerSession {
                 let mut auth_instructions = String::new();
                 let mut auth_prompts = vec![];
 
-                // Charged before anything borrows `self`, and before any
-                // auth-state work, so a capped client stops allocating. One
-                // counter governs the round; see `MAX_WEB_AUTH_WAITS`.
-                let mut web_approval_is_retry = false;
-                if kinds.contains(&CredentialKind::WebUserApproval) {
-                    web_approval_is_retry = self.web_auth_waits_used > 0;
-                    let (used, capped) = bump_waits(self.web_auth_waits_used);
-                    self.web_auth_waits_used = used;
-                    if capped {
-                        warn!(
-                            waits_used = used,
-                            "Too many browser-approval waits on this connection"
-                        );
-                        self.auth_state = None;
-                        return Ok(russh::server::Auth::reject());
-                    }
-                }
-
-                let Some((auth_state, _)) = self.auth_state.as_ref() else {
+                // Cloned, not borrowed: everything the round needs afterwards
+                // wants `&mut self`, so no borrow of `self` may outlive this
+                // point.
+                let Some((auth_state, _)) = self.auth_state.clone() else {
                     return Ok(russh::server::Auth::Reject {
                         proceed_with_methods: None,
                         partial_success: false,
@@ -2229,29 +2222,15 @@ impl ServerSession {
                 }
 
                 if kinds.contains(&CredentialKind::WebUserApproval) {
-                    let identification_string =
-                        auth_state.lock().await.identification_string().to_owned();
-
-                    let ext_url =
-                        construct_external_url(None, &*self.services.config.lock().await, None)
-                            .await
-                            .inspect_err(|error| {
-                                warn!(?error, "Failed to construct external URL");
-                            })
-                            .ok();
-
-                    let auth_state = auth_state.lock().await;
-                    let login_url =
-                        ext_url.map(|ext_url| auth_state.construct_web_approval_url(ext_url));
-
-                    auth_instructions.push_str(&format_web_auth_instructions(
-                        login_url,
-                        &identification_string,
-                    ));
-                    auth_prompts.push(("Press Enter when done: ".into(), true));
-
-                    if web_approval_is_retry {
-                        auth_instructions.push_str(WEB_AUTH_NOT_CONFIRMED_MESSAGE);
+                    if let WebApprovalRoundOutcome::Return(auth) = self
+                        .web_approval_round_manual(
+                            &auth_state,
+                            &mut auth_instructions,
+                            &mut auth_prompts,
+                        )
+                        .await
+                    {
+                        return Ok(auth);
                     }
                 }
 
@@ -2277,6 +2256,57 @@ impl ServerSession {
                 }
             }
         })
+    }
+
+    /// Today's Press-Enter web-approval round, behaviour unchanged.
+    ///
+    /// `subscribe()` is deliberately never called on this path: doing so would
+    /// create a `completion_signals` entry on every stale-pubkey login, which
+    /// lives until `complete()` or `vacuum()` — a behavioural delta from today.
+    async fn web_approval_round_manual(
+        &mut self,
+        auth_state: &Arc<Mutex<AuthState>>,
+        auth_instructions: &mut String,
+        auth_prompts: &mut Vec<(Cow<'static, str>, bool)>,
+    ) -> WebApprovalRoundOutcome {
+        // Charged first, so a capped client stops doing auth-state work. This
+        // is the same per-connection budget the auto path charges — see
+        // `MAX_WEB_AUTH_WAITS`.
+        let is_retry = self.web_auth_waits_used > 0;
+        let (used, capped) = bump_waits(self.web_auth_waits_used);
+        self.web_auth_waits_used = used;
+        if capped {
+            warn!(
+                waits_used = used,
+                "Too many browser-approval waits on this connection"
+            );
+            self.auth_state = None;
+            return WebApprovalRoundOutcome::Return(russh::server::Auth::reject());
+        }
+
+        let identification_string = auth_state.lock().await.identification_string().to_owned();
+
+        let ext_url = construct_external_url(None, &*self.services.config.lock().await, None)
+            .await
+            .inspect_err(|error| {
+                warn!(?error, "Failed to construct external URL");
+            })
+            .ok();
+
+        let auth_state = auth_state.lock().await;
+        let login_url = ext_url.map(|ext_url| auth_state.construct_web_approval_url(ext_url));
+
+        auth_instructions.push_str(&format_web_auth_instructions(
+            login_url,
+            &identification_string,
+        ));
+        auth_prompts.push(("Press Enter when done: ".into(), true));
+
+        if is_retry {
+            auth_instructions.push_str(WEB_AUTH_NOT_CONFIRMED_MESSAGE);
+        }
+
+        WebApprovalRoundOutcome::Continue
     }
 
     fn get_remaining_auth_methods(&self, kinds: HashSet<CredentialKind>) -> MethodSet {
