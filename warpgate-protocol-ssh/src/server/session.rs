@@ -118,6 +118,26 @@ impl PendingKeyboardInteractiveAuth {
     }
 }
 
+/// How many auto-continue waits one TCP connection may start.
+///
+/// This is the server-owned bound for the auto path. The client's
+/// `number_of_password_prompts` is not a control we own, and russh's
+/// `max_auth_attempts` is a dead field — declared and defaulted, but nothing in
+/// the crate enforces it.
+const MAX_WEB_AUTH_WAITS: u8 = 3;
+
+/// Charge one wait against the per-connection budget, returning the new count
+/// and whether the cap has been exceeded.
+///
+/// Increment-before-compare is deliberate: it permits exactly
+/// [`MAX_WEB_AUTH_WAITS`] waits and rejects at the start of the next one. The
+/// add saturates because post-cap attempts keep incrementing before they are
+/// rejected, and a wrapping `u8` would silently hand the client a fresh budget.
+const fn bump_waits(used: u8) -> (u8, bool) {
+    let used = used.saturating_add(1);
+    (used, used > MAX_WEB_AUTH_WAITS)
+}
+
 /// Consume the previous round's pending state and produce this round's, moving
 /// the web-approval wait — and therefore its live broadcast receiver — forward.
 ///
@@ -173,6 +193,16 @@ pub struct ServerSession {
     cached_successful_ticket_auth: Option<CachedSuccessfulTicketAuth>,
     allowed_auth_methods: MethodSet,
     host_key_trust_prompt_active: Arc<AtomicBool>,
+    /// Auto-continue web-approval waits started on this connection.
+    ///
+    /// This lives here, not on `PendingKeyboardInteractiveAuth`, because that
+    /// struct is re-stored only on the `Auth::Partial` path and dropped by every
+    /// terminal return — a counter there would reset on the next
+    /// keyboard-interactive attempt and the cap could never fire. `ServerSession`
+    /// is constructed once per accepted TCP stream and dies with the connection,
+    /// so the count survives `self.auth_state = None`, every terminal reject, and
+    /// any number of fresh `USERAUTH_REQUEST`s.
+    web_auth_waits_used: u8,
 }
 
 fn session_debug_tag(id: &SessionId, remote_address: &SocketAddr) -> String {
@@ -301,6 +331,7 @@ impl ServerSession {
             cached_successful_ticket_auth: None,
             allowed_auth_methods: get_allowed_auth_methods(services).await?,
             host_key_trust_prompt_active: Arc::new(AtomicBool::new(false)),
+            web_auth_waits_used: 0,
         };
 
         let mut so_rx = this.service_output.subscribe();
