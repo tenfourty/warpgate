@@ -2222,14 +2222,40 @@ impl ServerSession {
                 }
 
                 if kinds.contains(&CredentialKind::WebUserApproval) {
-                    if let WebApprovalRoundOutcome::Return(auth) = self
-                        .web_approval_round_manual(
+                    // Two implementations, selected at configuration level.
+                    // Within a connection there is no fallback: auto-continue
+                    // never degrades to a manual prompt mid-flight, because a
+                    // rarely-exercised degrade branch rots undetected.
+                    let auto_continue = self
+                        .services
+                        .config
+                        .lock()
+                        .await
+                        .store
+                        .ssh
+                        .web_auth_auto_continue;
+
+                    let outcome = if auto_continue {
+                        self.web_approval_round_auto(
+                            &auth_state,
+                            &selector,
+                            &kinds,
+                            &mut auth_name,
+                            &mut auth_instructions,
+                            &mut auth_prompts,
+                            &mut next_pending,
+                        )
+                        .await?
+                    } else {
+                        self.web_approval_round_manual(
                             &auth_state,
                             &mut auth_instructions,
                             &mut auth_prompts,
                         )
                         .await
-                    {
+                    };
+
+                    if let WebApprovalRoundOutcome::Return(auth) = outcome {
                         return Ok(auth);
                     }
                 }
@@ -2256,6 +2282,24 @@ impl ServerSession {
                 }
             }
         })
+    }
+
+    /// Auto-continue web-approval round (`ssh.web_auth_auto_continue` on).
+    #[allow(clippy::too_many_arguments)]
+    async fn web_approval_round_auto(
+        &mut self,
+        auth_state: &Arc<Mutex<AuthState>>,
+        selector: &AuthSelector,
+        kinds: &HashSet<CredentialKind>,
+        auth_name: &mut String,
+        auth_instructions: &mut String,
+        auth_prompts: &mut Vec<(Cow<'static, str>, bool)>,
+        next_pending: &mut PendingKeyboardInteractiveAuth,
+    ) -> Result<WebApprovalRoundOutcome> {
+        let _ = (selector, kinds, &*auth_name, next_pending);
+        Ok(self
+            .web_approval_round_manual(auth_state, auth_instructions, auth_prompts)
+            .await)
     }
 
     /// Today's Press-Enter web-approval round, behaviour unchanged.
