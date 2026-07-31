@@ -2951,7 +2951,7 @@ mod tests {
 
     use super::{
         MAX_WEB_AUTH_WAITS, PendingKeyboardInteractiveAuth, WebApprovalWait, WebAuthStep,
-        bump_waits, carry_forward, next_web_auth_step, wait_for_state,
+        bump_waits, carry_forward, next_web_auth_step, round_creates_wait, wait_for_state,
     };
 
     fn accepted() -> AuthResult {
@@ -3029,6 +3029,86 @@ mod tests {
         let (used, capped) = bump_waits(used);
         assert_eq!(used, MAX_WEB_AUTH_WAITS + 1);
         assert!(capped, "a discard must not restart the wait budget");
+    }
+
+    /// One entry into `web_approval_round_auto`, charging the per-connection
+    /// budget exactly where the real round does.
+    fn round(
+        used: u8,
+        pending: Option<&WebApprovalWait>,
+        state_id: Uuid,
+        totp_outstanding: bool,
+    ) -> (u8, bool) {
+        if round_creates_wait(pending, state_id, totp_outstanding) {
+            bump_waits(used)
+        } else {
+            (used, false)
+        }
+    }
+
+    /// I6: the cap counts waits regardless of which block created them. The
+    /// TOTP-outstanding block creates a wait too — it subscribes and stores one —
+    /// so it must charge the budget. Without this a TOTP+web user gets an
+    /// uncharged wait, and repeated TOTP-outstanding rounds re-subscribe for
+    /// free.
+    #[test]
+    fn unit_web_auth_totp_outstanding_round_charges_the_budget() {
+        let (sender, _) = broadcast::channel::<AuthResult>(1);
+        let state_id = Uuid::new_v4();
+
+        // Each TOTP-outstanding round carries the previous round's wait, so the
+        // state id matches — the charge must not be skipped on that account.
+        let carried = wait_bound_to(state_id, &sender);
+
+        let mut used = 0u8;
+        for _ in 0..MAX_WEB_AUTH_WAITS {
+            let (next, capped) = round(used, Some(&carried), state_id, true);
+            assert!(
+                next > used,
+                "a TOTP-outstanding round must consume one from the budget"
+            );
+            used = next;
+            assert!(!capped);
+        }
+
+        let (used, capped) = round(used, Some(&carried), state_id, true);
+        assert_eq!(used, MAX_WEB_AUTH_WAITS + 1);
+        assert!(
+            capped,
+            "a TOTP-outstanding round past the cap must reject, not create a fourth wait"
+        );
+    }
+
+    /// A farewell round rejects without creating anything, so it must not charge
+    /// the budget.
+    #[test]
+    fn unit_web_auth_farewell_round_does_not_charge_the_budget() {
+        let (sender, _) = broadcast::channel::<AuthResult>(1);
+        let state_id = Uuid::new_v4();
+        let mut farewell = wait_bound_to(state_id, &sender);
+        farewell.farewell = true;
+
+        assert!(!round_creates_wait(Some(&farewell), state_id, false));
+        // Even with TOTP still outstanding, the farewell reject comes first.
+        assert!(!round_creates_wait(Some(&farewell), state_id, true));
+        assert_eq!(round(MAX_WEB_AUTH_WAITS, Some(&farewell), state_id, true), (MAX_WEB_AUTH_WAITS, false));
+    }
+
+    /// Rounds 2..N reuse the carried wait, so they charge nothing — the budget
+    /// bounds waits, not rounds.
+    #[test]
+    fn unit_web_auth_poll_round_does_not_charge_the_budget() {
+        let (sender, _) = broadcast::channel::<AuthResult>(1);
+        let state_id = Uuid::new_v4();
+        let carried = wait_bound_to(state_id, &sender);
+
+        assert!(!round_creates_wait(Some(&carried), state_id, false));
+        assert_eq!(round(1, Some(&carried), state_id, false), (1, false));
+
+        // A wait bound to another principal is discarded, which does create one.
+        assert!(round_creates_wait(Some(&carried), Uuid::new_v4(), false));
+        // As does having no wait at all.
+        assert!(round_creates_wait(None, state_id, false));
     }
 
     /// I6: the cap counts **waits**, not rounds — three waits pass and the
