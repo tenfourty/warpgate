@@ -36,9 +36,29 @@ async fn forward_web_auth_requests(
     web_auth_request_signal: broadcast::Sender<Uuid>,
     id: Uuid,
 ) {
-    while let Ok(AuthResult::Need(result)) = state_change_rx.recv().await {
-        if result.contains(&CredentialKind::WebUserApproval) {
-            let _ = web_auth_request_signal.send(id);
+    loop {
+        match state_change_rx.recv().await {
+            Ok(AuthResult::Need(result)) => {
+                if result.contains(&CredentialKind::WebUserApproval) {
+                    let _ = web_auth_request_signal.send(id);
+                }
+            }
+            // Not a web-approval request, but the state machine can still emit
+            // a `Need` later in this auth attempt — keep listening.
+            Ok(_) => {}
+            // The channel has capacity 1, so a burst of state changes drops
+            // values. Losing an intermediate state is survivable; giving up is
+            // not, because nothing else would ever surface a pending approval
+            // for this auth state to the web UI.
+            Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                tracing::warn!(
+                    %id,
+                    dropped,
+                    "Auth state change stream lagged; continuing to watch for web-approval requests"
+                );
+            }
+            // The auth state is gone. Nothing further can arrive.
+            Err(broadcast::error::RecvError::Closed) => break,
         }
     }
 }
@@ -319,7 +339,11 @@ mod tests {
         // still emit a `Need` afterwards. Bailing out on the first non-`Need`
         // value strands the auth state with no signal ever sent.
         let fired = drain(vec![AuthResult::Rejected, need_web_approval()]).await;
-        assert_eq!(fired.len(), 1, "signal must still fire after a non-Need verdict");
+        assert_eq!(
+            fired.len(),
+            1,
+            "signal must still fire after a non-Need verdict"
+        );
     }
 
     #[tokio::test]
@@ -333,7 +357,11 @@ mod tests {
             need_web_approval(),
         ])
         .await;
-        assert_eq!(fired.len(), 1, "signal must still fire after a Lagged error");
+        assert_eq!(
+            fired.len(),
+            1,
+            "signal must still fire after a Lagged error"
+        );
     }
 
     #[tokio::test]
