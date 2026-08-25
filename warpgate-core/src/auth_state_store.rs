@@ -55,6 +55,21 @@ pub fn ip_allowed(
     ranges.iter().any(|network| network.contains(&ip))
 }
 
+/// Forwards web-approval requests from one auth state's change stream to the
+/// store-wide `web_auth_request_signal`, which is what lets the web UI list
+/// pending approvals. Spawned once per auth state.
+async fn forward_web_auth_requests(
+    mut state_change_rx: broadcast::Receiver<AuthResult>,
+    web_auth_request_signal: broadcast::Sender<Uuid>,
+    id: Uuid,
+) {
+    while let Ok(AuthResult::Need(result)) = state_change_rx.recv().await {
+        if result.contains(&CredentialKind::WebUserApproval) {
+            let _ = web_auth_request_signal.send(id);
+        }
+    }
+}
+
 /// Checks whether the given IP is allowed by the user's `allowed_ip_ranges` setting.
 /// Returns `Ok(())` if access is allowed, or an appropriate `WarpgateError` if denied.
 pub fn check_ip_allowed(
@@ -289,15 +304,13 @@ impl AuthStateStore {
 
         // Small backlog so subscribers that briefly fall behind still see the
         // terminal transition; laggards re-check the state directly.
-        let (state_change_tx, mut state_change_rx) = broadcast::channel(8);
+        let (state_change_tx, state_change_rx) = broadcast::channel(8);
         let web_auth_request_signal = self.web_auth_request_signal.clone();
-        tokio::spawn(async move {
-            while let Ok(AuthResult::Need(result)) = state_change_rx.recv().await {
-                if result.contains(&CredentialKind::WebUserApproval) {
-                    let _ = web_auth_request_signal.send(id);
-                }
-            }
-        });
+        tokio::spawn(forward_web_auth_requests(
+            state_change_rx,
+            web_auth_request_signal,
+            id,
+        ));
 
         let state = AuthState::new(
             id,
@@ -402,6 +415,7 @@ impl AuthStateStore {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::str::FromStr;
 
     use ipnet::IpNet;
@@ -579,6 +593,80 @@ mod tests {
             wait_for_auth_completion_within(&state, Duration::from_millis(50)).await,
             AuthResult::Rejected
         ));
+    }
+
+    /// Drives `forward_web_auth_requests` over a pre-loaded channel.
+    ///
+    /// The sender is dropped before the forwarder runs, so the receiver drains
+    /// whatever is buffered and then observes `Closed` — which makes every case
+    /// below deterministic, with no sleeps and no task scheduling races. The
+    /// channel capacity of 1 is smaller than production's 8, which is what
+    /// makes the `Lagged` case reachable deterministically.
+    async fn drain(sent: Vec<AuthResult>) -> Vec<Uuid> {
+        let id = Uuid::new_v4();
+        let (state_change_tx, state_change_rx) = broadcast::channel(1);
+        let (signal_tx, mut signal_rx) = broadcast::channel(16);
+
+        for value in sent {
+            let _ = state_change_tx.send(value);
+        }
+        drop(state_change_tx);
+
+        forward_web_auth_requests(state_change_rx, signal_tx, id).await;
+
+        let mut fired = vec![];
+        while let Ok(got) = signal_rx.try_recv() {
+            fired.push(got);
+        }
+        fired
+    }
+
+    fn need_web_approval() -> AuthResult {
+        AuthResult::Need(HashSet::from([CredentialKind::WebUserApproval]))
+    }
+
+    #[tokio::test]
+    async fn unit_forwarder_survives_a_non_need_verdict() {
+        // `Rejected` is not a web-approval request, but the state machine can
+        // still emit a `Need` afterwards. Bailing out on the first non-`Need`
+        // value strands the auth state with no signal ever sent.
+        let fired = drain(vec![AuthResult::Rejected, need_web_approval()]).await;
+        assert_eq!(fired.len(), 1, "signal must still fire after a non-Need verdict");
+    }
+
+    #[tokio::test]
+    async fn unit_forwarder_survives_a_lagged_receiver() {
+        // The helper's channel capacity is 1, so pushing two values before the
+        // forwarder polls makes the receiver lag and `recv()` yield
+        // `Err(Lagged)`. Treating that as terminal kills the forwarder for the
+        // rest of the auth state's life.
+        let fired = drain(vec![
+            AuthResult::Rejected,
+            AuthResult::Rejected,
+            need_web_approval(),
+        ])
+        .await;
+        assert_eq!(fired.len(), 1, "signal must still fire after a Lagged error");
+    }
+
+    #[tokio::test]
+    async fn unit_forwarder_ignores_need_without_web_approval() {
+        let fired = drain(vec![AuthResult::Need(HashSet::from([
+            CredentialKind::Password,
+        ]))])
+        .await;
+        assert!(
+            fired.is_empty(),
+            "a Need that does not ask for web approval must not signal"
+        );
+    }
+
+    #[tokio::test]
+    async fn unit_forwarder_exits_when_sender_is_dropped() {
+        // `drain` awaits the forwarder to completion, so this test hanging
+        // rather than failing is itself the regression signal for `Closed`
+        // no longer terminating the loop.
+        assert!(drain(vec![]).await.is_empty());
     }
 
     #[test]
