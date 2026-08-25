@@ -1,10 +1,7 @@
 import asyncio
-import os
 import subprocess
 import time
-import uuid
 from pathlib import Path
-from textwrap import dedent
 from uuid import uuid4
 
 import aiohttp
@@ -12,7 +9,7 @@ import pytest
 
 from .api_client import admin_client, sdk
 from .conftest import ProcessManager, WarpgateProcess
-from .util import alloc_port, wait_port
+from .util import wait_port
 
 
 class Test:
@@ -133,74 +130,10 @@ class Test:
 # off) and waits on both `wg.http_port` and `wg.ssh_port` before touching
 # it, since `start_wg` does not wait on its own.
 #
-# `_start_ssh_server_no_selinux` below is a local copy of
-# `ProcessManager.start_ssh_server` (conftest.py) with `--security-opt
-# label=disable` added to the `docker run` invocation. This host runs with
-# SELinux Enforcing, and `start_ssh_server`'s plain `-v host_path:host_path`
-# bind mount (no `:z`/`:Z` relabel flag) is denied read access to the
-# generated sshd_config by SELinux, which makes the container exit 1
-# ("<path>: Permission denied") before it ever binds port 22 -- confirmed by
-# hand: the unmodified invocation fails every time within ~1s
-# (`docker inspect` shows `Status: exited, ExitCode: 1` and the container's
-# only log line is the permission error), while adding
-# `--security-opt label=disable` to the same command starts sshd cleanly
-# and a plain `nc` probe connects immediately. This is a pre-existing gap in
-# conftest.py, unrelated to ssh.web_auth_auto_continue, and conftest.py is
-# not a file this task may touch -- so every case that needs the SSH
-# session to actually complete (not just reach the SSH auth layer) routes
-# through this local helper instead of `ProcessManager.start_ssh_server`,
-# so the assertions below aren't gated on an unrelated environment bug.
-def _start_ssh_server_no_selinux(processes: "ProcessManager", trusted_keys):
-    port = alloc_port()
-    data_dir = processes.ctx.tmpdir / f"sshd-{uuid.uuid4()}"
-    data_dir.mkdir(parents=True)
-    authorized_keys_path = data_dir / "authorized_keys"
-    authorized_keys_path.write_text("\n".join(trusted_keys))
-    config_path = data_dir / "sshd_config"
-    config_path.write_text(
-        dedent(
-            f"""\
-            Port 22
-            AuthorizedKeysFile {authorized_keys_path}
-            AllowAgentForwarding yes
-            AllowTcpForwarding yes
-            GatewayPorts yes
-            X11Forwarding yes
-            UseDNS no
-            PermitTunnel yes
-            StrictModes no
-            PermitRootLogin yes
-            HostKey /ssh-keys/id_ed25519
-            Subsystem\tsftp\t/usr/lib/ssh/sftp-server
-            LogLevel DEBUG3
-            """
-        )
-    )
-    data_dir.chmod(0o700)
-    authorized_keys_path.chmod(0o600)
-    config_path.chmod(0o600)
-
-    processes.start(
-        [
-            "docker",
-            "run",
-            "--rm",
-            "--security-opt",
-            "label=disable",
-            "-p",
-            f"{port}:22",
-            "-v",
-            f"{data_dir}:{data_dir}",
-            "-v",
-            f"{os.getcwd()}/ssh-keys:/ssh-keys",
-            "warpgate-e2e-ssh-server",
-            "-f",
-            str(config_path),
-        ]
-    )
-    return port
-
-
+# Cases below use `ProcessManager.start_ssh_server` (conftest.py) directly --
+# it now passes `--security-opt label=disable` to the `docker run`
+# invocation itself (added in 60837adb), so the SELinux-Enforcing-host
+# permission denial that used to gate SSH sessions here no longer applies.
 def _setup_pubkey_user(api, ssh_port, pubkey_text, require_web_approval: bool):
     """Role + password/pubkey user + SSH target, mirroring the existing
     `Test.test` setup above. `require_web_approval` controls whether
@@ -284,7 +217,9 @@ class TestAutoContinue:
         wait_port(wg.http_port, for_process=wg.process, recv=False)
         wait_port(wg.ssh_port, for_process=wg.process)
 
-        ssh_port = _start_ssh_server_no_selinux(processes, [wg_c_ed25519_pubkey.read_text()])
+        ssh_port = processes.start_ssh_server(
+            trusted_keys=[wg_c_ed25519_pubkey.read_text()]
+        )
         wait_port(ssh_port)
 
         url = f"https://localhost:{wg.http_port}"
@@ -380,7 +315,9 @@ class TestAutoContinue:
         wait_port(wg.http_port, for_process=wg.process, recv=False)
         wait_port(wg.ssh_port, for_process=wg.process)
 
-        ssh_port = _start_ssh_server_no_selinux(processes, [wg_c_ed25519_pubkey.read_text()])
+        ssh_port = processes.start_ssh_server(
+            trusted_keys=[wg_c_ed25519_pubkey.read_text()]
+        )
         wait_port(ssh_port)
 
         url = f"https://localhost:{wg.http_port}"
@@ -441,7 +378,9 @@ class TestAutoContinue:
         wait_port(wg.http_port, for_process=wg.process, recv=False)
         wait_port(wg.ssh_port, for_process=wg.process)
 
-        ssh_port = _start_ssh_server_no_selinux(processes, [wg_c_ed25519_pubkey.read_text()])
+        ssh_port = processes.start_ssh_server(
+            trusted_keys=[wg_c_ed25519_pubkey.read_text()]
+        )
         wait_port(ssh_port)
 
         url = f"https://localhost:{wg.http_port}"
@@ -548,7 +487,9 @@ class TestAutoContinue:
         wait_port(wg.http_port, for_process=wg.process, recv=False)
         wait_port(wg.ssh_port, for_process=wg.process)
 
-        ssh_port = _start_ssh_server_no_selinux(processes, [wg_c_ed25519_pubkey.read_text()])
+        ssh_port = processes.start_ssh_server(
+            trusted_keys=[wg_c_ed25519_pubkey.read_text()]
+        )
         wait_port(ssh_port)
 
         pubkey_text = open("ssh-keys/id_ed25519.pub").read().strip()
@@ -657,7 +598,9 @@ class TestAutoContinue:
         wait_port(wg.http_port, for_process=wg.process, recv=False)
         wait_port(wg.ssh_port, for_process=wg.process)
 
-        ssh_port = _start_ssh_server_no_selinux(processes, [wg_c_ed25519_pubkey.read_text()])
+        ssh_port = processes.start_ssh_server(
+            trusted_keys=[wg_c_ed25519_pubkey.read_text()]
+        )
         wait_port(ssh_port)
 
         pubkey_text = open("ssh-keys/id_ed25519.pub").read().strip()

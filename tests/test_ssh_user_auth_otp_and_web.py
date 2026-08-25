@@ -1,8 +1,6 @@
 import asyncio
-import os
 import subprocess
 import tempfile
-import uuid
 from base64 import b64decode
 from pathlib import Path
 from textwrap import dedent
@@ -14,7 +12,7 @@ import pytest
 
 from .api_client import admin_client, sdk
 from .conftest import ProcessManager, WarpgateProcess
-from .util import alloc_port, wait_port
+from .util import wait_port
 
 
 class Test:
@@ -200,71 +198,10 @@ class Test:
 # ---------------------------------------------------------------------------
 # ssh.web_auth_auto_continue coverage: TOTP + web composite, flag on.
 #
-# `_start_ssh_server_no_selinux` is a local copy of
-# `ProcessManager.start_ssh_server` (conftest.py) with `--security-opt
-# label=disable` added to the `docker run` invocation, needed because this
-# host's SELinux Enforcing denies the container read access to the plain
-# bind-mounted sshd_config `start_ssh_server` writes (no `:z`/`:Z` relabel
-# flag) -- verified by hand: the unmodified invocation exits 1 with
-# "<path>: Permission denied" and never binds port 22, while adding
-# `--security-opt label=disable` to the same command starts sshd cleanly.
-# This is a pre-existing environment gap in conftest.py, unrelated to
-# ssh.web_auth_auto_continue; conftest.py isn't a file this task may touch,
-# so the case below routes through this local helper instead so its
-# assertions aren't gated on it. Duplicated from
-# test_ssh_user_auth_in_browser.py rather than shared, since these two
-# files are the only ones this task may modify.
-def _start_ssh_server_no_selinux(processes: "ProcessManager", trusted_keys):
-    port = alloc_port()
-    data_dir = processes.ctx.tmpdir / f"sshd-{uuid.uuid4()}"
-    data_dir.mkdir(parents=True)
-    authorized_keys_path = data_dir / "authorized_keys"
-    authorized_keys_path.write_text("\n".join(trusted_keys))
-    config_path = data_dir / "sshd_config"
-    config_path.write_text(
-        dedent(
-            f"""\
-            Port 22
-            AuthorizedKeysFile {authorized_keys_path}
-            AllowAgentForwarding yes
-            AllowTcpForwarding yes
-            GatewayPorts yes
-            X11Forwarding yes
-            UseDNS no
-            PermitTunnel yes
-            StrictModes no
-            PermitRootLogin yes
-            HostKey /ssh-keys/id_ed25519
-            Subsystem\tsftp\t/usr/lib/ssh/sftp-server
-            LogLevel DEBUG3
-            """
-        )
-    )
-    data_dir.chmod(0o700)
-    authorized_keys_path.chmod(0o600)
-    config_path.chmod(0o600)
-
-    processes.start(
-        [
-            "docker",
-            "run",
-            "--rm",
-            "--security-opt",
-            "label=disable",
-            "-p",
-            f"{port}:22",
-            "-v",
-            f"{data_dir}:{data_dir}",
-            "-v",
-            f"{os.getcwd()}/ssh-keys:/ssh-keys",
-            "warpgate-e2e-ssh-server",
-            "-f",
-            str(config_path),
-        ]
-    )
-    return port
-
-
+# The case below uses `ProcessManager.start_ssh_server` (conftest.py)
+# directly -- it now passes `--security-opt label=disable` to the `docker
+# run` invocation itself (added in 60837adb), so the SELinux-Enforcing-host
+# permission denial that used to gate this SSH session no longer applies.
 class TestAutoContinueOtpAndWeb:
     @pytest.mark.asyncio
     async def test_otp_and_web_auth_flag_on(
@@ -309,7 +246,9 @@ class TestAutoContinueOtpAndWeb:
         wait_port(wg.http_port, for_process=wg.process, recv=False)
         wait_port(wg.ssh_port, for_process=wg.process)
 
-        ssh_port = _start_ssh_server_no_selinux(processes, [wg_c_ed25519_pubkey.read_text()])
+        ssh_port = processes.start_ssh_server(
+            trusted_keys=[wg_c_ed25519_pubkey.read_text()]
+        )
         wait_port(ssh_port)
 
         url = f"https://localhost:{wg.http_port}"
