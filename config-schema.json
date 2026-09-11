@@ -101,6 +101,7 @@
     "ssh": {
       "$ref": "#/$defs/SshConfig",
       "default": {
+        "default_target": null,
         "enable": false,
         "external_host": null,
         "external_port": null,
@@ -109,7 +110,9 @@
         "keepalive_interval": null,
         "keys": "./data/keys",
         "listen": "[::]:2222",
-        "proxy_protocol": false
+        "proxy_protocol": false,
+        "web_auth_auto_continue": false,
+        "web_auth_wait_timeout": "2m"
       }
     },
     "sso_providers": {
@@ -118,6 +121,17 @@
       "items": {
         "$ref": "#/$defs/SsoProviderConfig"
       }
+    },
+    "step_up_interval": {
+      "description": "Per-protocol step-up SSO re-auth intervals. See\n[`StepUpIntervalConfig`]. `None` (the default) means no step-up on\nany surface - existing behaviour unchanged.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/StepUpIntervalConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "vnc": {
       "$ref": "#/$defs/VncConfig",
@@ -452,6 +466,14 @@
     "SshConfig": {
       "type": "object",
       "properties": {
+        "default_target": {
+          "description": "Default SSH target name when no target is specified (e.g., `ssh warpgate` instead of `ssh user:target@warpgate`)",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "enable": {
           "type": "boolean",
           "default": false
@@ -501,6 +523,16 @@
           "description": "Accept HAProxy PROXY protocol v1/v2 headers from the listener's peer.",
           "type": "boolean",
           "default": false
+        },
+        "web_auth_auto_continue": {
+          "description": "Complete the SSH browser-approval round without a `Press Enter` prompt,\nby polling the auth state across zero-prompt keyboard-interactive rounds.",
+          "type": "boolean",
+          "default": false
+        },
+        "web_auth_wait_timeout": {
+          "description": "How long one connection may keep polling for a browser approval before\nthe attempt is rejected.",
+          "type": "string",
+          "default": "2m"
         }
       }
     },
@@ -692,6 +724,14 @@
             "type": {
               "type": "string",
               "const": "custom"
+            },
+            "username_claim": {
+              "description": "Custom claim name to use as the Warpgate username.\nIf set, this claim is read from the ID token/userinfo and used\ninstead of preferred_username. Falls back to preferred_username then email.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
             }
           },
           "required": [
@@ -803,6 +843,52 @@
         "external_host",
         "host_header"
       ]
+    },
+    "StepUpIntervalConfig": {
+      "description": "Per-protocol step-up SSO re-auth intervals.\n\nWhen set for a given protocol, the protocol handler consults a freshness\nstamp (e.g. `credentials_public_key.last_sso_at` for SSH pubkey) and, if\nthe last step-up is older than the interval (or never happened), forces\na `WebUserApproval` / SSO handshake before granting the session.\n\nLeaving a field as `None` disables the step-up gate for that protocol -\nexisting auth behaviour is unchanged. MySQL / Postgres fields are accepted\nfor forward-compatibility with the shared YAML surface but currently\nno-op (password-only protocols have no SSO path upstream); they emit a\nwarning at load time. The `kubernetes` field is implemented but one-way -\nsee its own doc comment; it warns at load time too.",
+      "type": "object",
+      "properties": {
+        "http": {
+          "description": "Per-session step-up interval for HTTP (stored on the Poem session).",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "kubernetes": {
+          "description": "Per-cert step-up interval for Kubernetes (`credentials_certificate.last_sso_at`).\n\nDANGER: the gate ships without its stamp site. Nothing in the running\nserver ever writes `credentials_certificate.last_sso_at`, so the stamp\nstays `NULL`, every freshness check fails, and setting this field 401s\nevery certificate-authenticated Kubernetes client permanently - there is\nno handshake that can clear it. Leave it unset unless you are prepared\nto hand-stamp the column by SQL. A load-time warning says the same.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "mysql": {
+          "description": "Accepted for forward-compat; MySQL is password-only upstream, so this\ncurrently no-ops and logs a warning on config load.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "postgres": {
+          "description": "Accepted for forward-compat; Postgres is password-only upstream, so this\ncurrently no-ops and logs a warning on config load.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "ssh": {
+          "description": "Per-pubkey step-up interval for SSH (`credentials_public_key.last_sso_at`).",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      }
     },
     "VncConfig": {
       "type": "object",

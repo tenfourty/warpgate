@@ -2,7 +2,7 @@
   "openapi": "3.0.0",
   "info": {
     "title": "Warpgate HTTP proxy",
-    "version": "v0.28.5-2-gdf0d7612-modified"
+    "version": "v0.28.6-48-g532ee4e8-modified"
   },
   "servers": [
     {
@@ -544,6 +544,40 @@
           }
         },
         "operationId": "start_sso"
+      }
+    },
+    "/sso/auto-start": {
+      "get": {
+        "summary": "Server-side auto-SSO entry point.",
+        "description": "A front door that gates its own traffic and rides a `public` HTTP target\n(so Warpgate's own `page_auth` auto-redirect never sees the request)\nredirects unauthenticated browser navigations here instead of straight\nto the gateway login SPA. When the operator has opted into\nsingle-provider auto-redirect, this 302s directly to the IdP authorize\nURL — no SPA render, no button click. Otherwise (feature off, not\nexactly one provider, a provider/host mismatch, or the\n`?login=password` break-glass) it 302s to the normal gateway login page,\npreserving `next`.\n\nUnauthenticated by design (mirrors `/sso/providers` + `/sso/*/start`):\nit only ever *initiates* a login, and the resulting `next` is validated\nagainst [`is_safe_redirect_target`] before use.",
+        "parameters": [
+          {
+            "name": "next",
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "required": false,
+            "deprecated": false,
+            "explode": true
+          },
+          {
+            "name": "login",
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "required": false,
+            "deprecated": false,
+            "explode": true
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Browser redirect — either straight to the IdP authorize URL (auto-SSO\nenabled, exactly one provider) or back to the gateway login SPA\n(feature off, not exactly one provider, or `?login=password`)."
+          }
+        },
+        "operationId": "auto_start_sso"
       }
     },
     "/profile/credentials": {
@@ -2108,6 +2142,7 @@
         "required": [
           "ports",
           "password_login_mode",
+          "sso_auto_redirect",
           "minimize_password_login",
           "authorized_via_ticket",
           "authorized_via_sso_with_single_logout",
@@ -2144,6 +2179,9 @@
           },
           "password_login_mode": {
             "$ref": "#/components/schemas/PasswordLoginMode"
+          },
+          "sso_auto_redirect": {
+            "type": "boolean"
           },
           "minimize_password_login": {
             "type": "boolean",

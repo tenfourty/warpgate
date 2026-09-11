@@ -2,7 +2,7 @@
   "openapi": "3.0.0",
   "info": {
     "title": "Warpgate Web Admin",
-    "version": "v0.28.5-2-gdf0d7612-modified"
+    "version": "v0.28.6-48-g532ee4e8-modified"
   },
   "servers": [
     {
@@ -120,6 +120,76 @@
           }
         ],
         "operationId": "close_all_sessions"
+      }
+    },
+    "/sessions/for-user/{id}": {
+      "delete": {
+        "summary": "Close this node's live sessions belonging to a user. The cluster-wide\nentry point is [`close_sessions_for_user`], which calls this on each peer.",
+        "parameters": [
+          {
+            "name": "id",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "in": "path",
+            "required": true,
+            "deprecated": false,
+            "explode": true
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "TokenSecurityScheme": []
+          },
+          {
+            "CookieSecurityScheme": []
+          },
+          {
+            "ClusterTokenSecurityScheme": []
+          }
+        ],
+        "operationId": "close_sessions_for_user"
+      }
+    },
+    "/sessions/for-ticket/{id}": {
+      "delete": {
+        "summary": "Close this node's live sessions opened with a ticket. The cluster-wide\nentry point is [`close_sessions_for_ticket`].",
+        "parameters": [
+          {
+            "name": "id",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "in": "path",
+            "required": true,
+            "deprecated": false,
+            "explode": true
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "TokenSecurityScheme": []
+          },
+          {
+            "CookieSecurityScheme": []
+          },
+          {
+            "ClusterTokenSecurityScheme": []
+          }
+        ],
+        "operationId": "close_sessions_for_ticket"
       }
     },
     "/sessions/{id}": {
@@ -4989,6 +5059,11 @@
             "type": "string",
             "format": "date-time"
           },
+          "last_sso_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Timestamp of the last step-up SSO refresh that stamped this credential.\n`None` if the credential has never been gated on a fresh SSO - either\nstep-up is disabled, the user hasn't reconnected since the feature\nshipped, or the feature is disabled globally."
+          },
           "fingerprint": {
             "type": "string"
           }
@@ -5043,6 +5118,11 @@
           "last_used": {
             "type": "string",
             "format": "date-time"
+          },
+          "last_sso_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Timestamp of the last step-up SSO refresh that stamped this credential.\n`None` if the credential has never been gated on a fresh SSO - either\nstep-up is disabled, the user hasn't reconnected since the feature\nshipped, or the feature is disabled globally."
           },
           "openssh_public_key": {
             "type": "string"
@@ -5674,6 +5754,9 @@
           "password_login_mode": {
             "$ref": "#/components/schemas/PasswordLoginMode"
           },
+          "sso_auto_redirect": {
+            "type": "boolean"
+          },
           "ticket_self_service_enabled": {
             "type": "boolean"
           },
@@ -5815,6 +5898,7 @@
           "ssh_client_auth_keyboard_interactive",
           "ssh_host_key_verification",
           "password_login_mode",
+          "sso_auto_redirect",
           "minimize_password_login",
           "ticket_self_service_enabled",
           "ticket_auto_approve_existing_access",
@@ -5868,6 +5952,9 @@
           },
           "password_login_mode": {
             "$ref": "#/components/schemas/PasswordLoginMode"
+          },
+          "sso_auto_redirect": {
+            "type": "boolean"
           },
           "minimize_password_login": {
             "type": "boolean",
@@ -6833,7 +6920,8 @@
         "title": "TargetHTTPOptions",
         "required": [
           "url",
-          "tls"
+          "tls",
+          "public"
         ],
         "properties": {
           "url": {
@@ -6850,6 +6938,10 @@
           },
           "external_host": {
             "type": "string"
+          },
+          "public": {
+            "type": "boolean",
+            "description": "Per-VM-proxy P0 (M9): when `true`, the catchall HTTP proxy serves\nthis target without requiring a Warpgate session. Anonymous and\nsession-authed clients pass through; admin/user API tokens hit a\npublic target -> 401 (tokens are admin-API-scoped, not proxy-scoped).\nDefault `false` preserves existing behaviour; serde-default backfills\nexisting JSON-column rows so no DB migration is required."
           }
         }
       },
@@ -7216,6 +7308,13 @@
           "jump_host": {
             "type": "string",
             "format": "uuid"
+          },
+          "env": {
+            "type": "object",
+            "description": "Custom environment variables to inject into downstream SSH sessions",
+            "additionalProperties": {
+              "type": "string"
+            }
           }
         }
       },
