@@ -1,21 +1,35 @@
 # syntax=docker/dockerfile:1.6
+# hadolint global ignore=DL3008
+#
 # Cove-patched Warpgate build.
 #
-# Patches are already applied in the source tree (branch cove-patches). This
-# Dockerfile differs from upstream's in two ways that cut rebuild time on
-# iterative changes from ~20 minutes to ~3-5 minutes:
+# Patches are already applied in the source tree (branch cove-patches-v0.28.6).
+# This Dockerfile tracks upstream's docker/Dockerfile with two deliberate
+# divergences:
 #
-#   1. npm deps live in their own layer keyed on package-lock.json only, so a
-#      source edit does not bust `npm ci`.
-#   2. cargo registry / git / target dirs are BuildKit cache mounts, so
-#      `cargo build` only recompiles crates whose sources actually changed
-#      instead of starting from scratch every build.
+#   1. DEBIAN 12 (bookworm), NOT bullseye. Upstream is still on
+#      rust:1.97.1-bullseye / debian:bullseye-*, but Debian 11's security
+#      archive went EOL 2026-08-31 and `apt-get update` now 404s, so an
+#      upstream-identical image cannot be built at all. Both stages are
+#      pinned to bookworm by digest. Revisit when upstream moves.
 #
-# Build on memory-constrained hosts (e.g. baba, 12 GB) with
+#   2. Build caching. npm deps live in their own layer keyed on
+#      package-lock.json, and the cargo registry/git/target dirs are BuildKit
+#      cache mounts, so `cargo build` only recompiles crates whose sources
+#      actually changed. This cuts an iterative rebuild from ~20 min to
+#      ~3-5 min. REQUIRES BuildKit (DOCKER_BUILDKIT=1 or docker >= 23);
+#      without it the `--mount=type=cache` lines are a syntax error.
+#
+# Everything else is upstream's: Node 24 + openjdk-17 (the OpenAPI generator
+# needs a JRE), the just-driven frontend build, the mysql/postgres/rdp feature
+# set, `COPY .git/` for version embedding, SOURCE_DATE_EPOCH for rust-embed
+# determinism, and sqlite3/wget in the runtime image.
+#
+# Memory: aws-sdk-ec2 peaks around 6-8 GB during link at default all-cores
+# parallelism. On a memory-constrained host build with
 #   --build-arg CARGO_BUILD_JOBS=2
-# to cap rustc parallelism. aws-sdk-ec2 alone peaks around 6-8 GB during
-# link with default all-cores parallelism and will OOM without this cap.
-FROM rust:1.85.0-bullseye AS build
+# to cap rustc parallelism, otherwise the build OOMs.
+FROM rust:1.97.1-bookworm@sha256:408fe88047cef61a2087653b0c5255fa51c0f2d6d94ddedd7a2562a9b91a46f6 AS build
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -23,49 +37,54 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
     && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates-java nodejs openjdk-17-jdk \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && cargo install --locked just@1.4.0
 
 # npm deps layer — invalidated only when package-lock.json changes.
 # --ignore-scripts skips the package.json postinstall (openapi client
-# generation) which needs source files not yet present in this layer.
-# The explicit `npm run openapi:client:*` steps below handle that after
-# the full source copy.
+# generation), which needs source files not yet present in this layer;
+# `just openapi` below regenerates them after the full source copy.
 WORKDIR /opt/warpgate/warpgate-web
 COPY warpgate-web/package.json warpgate-web/package-lock.json ./
 RUN --mount=type=cache,target=/root/.npm,id=warpgate-npm \
     npm ci --ignore-scripts
 
-# Full source copy — this layer is busted on any edit, but the npm and
-# cargo caches above/below are preserved.
+# Full source copy — this layer is busted on any edit, but the npm and cargo
+# caches around it are preserved.
 WORKDIR /opt/warpgate
 COPY . .
 
-# Frontend build. node_modules was populated in the deps layer and survives
-# the COPY above.
-WORKDIR /opt/warpgate/warpgate-web
-RUN npm run openapi:client:admin \
-    && npm run openapi:client:gateway \
-    && npm run build
+# Needed to correctly embed the version number and the dirty state flag.
+COPY .git/ /opt/warpgate/.git/
 
-# Rust release build with persistent caches. The final binary is copied out
-# of the target cache mount so it ends up in the image filesystem rather
-# than evaporating with the mount.
-WORKDIR /opt/warpgate
+# for rust-embed determinism
+ENV SOURCE_DATE_EPOCH=0
+
+# Frontend build. node_modules was populated in the deps layer and survives
+# the COPY above. `just openapi` regenerates the OpenAPI schema + TS clients
+# from source, replacing the postinstall that --ignore-scripts skipped.
+RUN just openapi \
+    && just npm run build
+
+# Rust release build with persistent caches. The binary is copied out of the
+# target cache mount so it lands in the image filesystem rather than
+# evaporating with the mount.
 ARG CARGO_BUILD_JOBS=default
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=warpgate-cargo-registry \
     --mount=type=cache,target=/usr/local/cargo/git,id=warpgate-cargo-git \
     --mount=type=cache,target=/opt/warpgate/target,id=warpgate-cargo-target \
-    cargo build --release \
+    cargo build --features mysql,postgres,rdp-openssl-tls --release \
     && cp target/release/warpgate /warpgate
 
-FROM debian:bullseye-slim
+FROM debian:bookworm-slim@sha256:5ae3c39ebd15e229dcedd5cee596b2497182493d41ff162e824ba13fc1b2b867
 LABEL maintainer="cove-patched"
 ARG USER_ID=1000
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get -y update -qq \
-    && apt-get install --no-install-recommends --no-install-suggests -y ca-certificates \
+    && apt-get install --no-install-recommends --no-install-suggests -y \
+       ca-certificates wget sqlite3 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
