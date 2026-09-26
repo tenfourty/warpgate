@@ -80,6 +80,21 @@ pub struct SecurityStatus {
     pub failed_attempts_last_24h: u64,
 }
 
+/// One row for the admin "blocked IPs" listing: the stored block plus
+/// whether the address is currently on the exempt list.
+///
+/// `is_exempt` is computed with the exact same predicate,
+/// `LoginProtectionConfig::is_ip_exempt`, that `check_ip_blocked` applies,
+/// so a row can never disagree with what actually gets enforced: an exempt
+/// address can still have a stale block row (written before it was
+/// exempted, or before the exempt list changed), and this is what lets the
+/// admin UI say so instead of implying the block is live.
+#[derive(Clone, Debug)]
+pub struct BlockedIpEntry {
+    pub info: IpBlockInfo,
+    pub is_exempt: bool,
+}
+
 /// Statistics from a cleanup run.
 #[derive(Clone, Debug)]
 #[allow(clippy::struct_field_names)]
@@ -573,10 +588,17 @@ impl LoginProtectionService {
         })
     }
 
-    /// List all currently blocked IPs.
-    pub async fn list_blocked_ips(&self) -> Result<Vec<IpBlockInfo>, WarpgateError> {
+    /// List all currently blocked IPs, flagging any row whose address is on
+    /// the exempt list (runcove-ljvj.24). `check_ip_blocked` already ignores
+    /// such a row when deciding whether to enforce a block; this reuses that
+    /// exact decision (`config.is_ip_exempt`) rather than a second copy of
+    /// it, so the admin listing can never disagree with what is enforced.
+    pub async fn list_blocked_ips(&self) -> Result<Vec<BlockedIpEntry>, WarpgateError> {
         let db = &self.db;
         let now = OffsetDateTime::now_utc();
+        // Read once and reuse for every row, rather than once per row: the
+        // exemption list does not change between the rows of one listing.
+        let config = Self::read_config(db).await?;
         let blocks = IpBlock::Entity::find()
             .filter(IpBlock::Column::ExpiresAt.gt(now))
             .all(db)
@@ -586,12 +608,16 @@ impl LoginProtectionService {
             .into_iter()
             .filter_map(|block| {
                 let ip = block.ip_address.parse::<IpAddr>().ok()?;
-                Some(IpBlockInfo {
-                    ip_address: ip,
-                    blocked_at: block.blocked_at,
-                    expires_at: block.expires_at,
-                    block_count: block.block_count,
-                    reason: block.reason,
+                let is_exempt = config.is_ip_exempt(&ip);
+                Some(BlockedIpEntry {
+                    info: IpBlockInfo {
+                        ip_address: ip,
+                        blocked_at: block.blocked_at,
+                        expires_at: block.expires_at,
+                        block_count: block.block_count,
+                        reason: block.reason,
+                    },
+                    is_exempt,
                 })
             })
             .collect())
@@ -847,6 +873,38 @@ mod tests {
         // The row (and the cache entry) are still there, but no longer count.
         assert!(block_row(&db, EXEMPT_V4).await.is_some());
         assert!(service.check_ip_blocked(&ip).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn list_blocked_ips_flags_the_exempt_row_and_not_the_other() {
+        // runcove-ljvj.24: the admin listing must flag a row whose address
+        // is exempt, and must not flag one that is not.
+        let db = setup_db(&[]).await;
+        let service = LoginProtectionService::new(db.clone()).await.unwrap();
+
+        // Block BOTH while neither is exempt yet: an already-exempt address
+        // is never blocked in the first place (see the case above), so a
+        // row that should end up flagged has to exist BEFORE the exemption
+        // is added -- the same shape as the stale row Jeremy found live.
+        fail(&service, EXEMPT_V4, 5).await;
+        fail(&service, OTHER_V4, 5).await;
+        assert!(block_row(&db, EXEMPT_V4).await.is_some());
+        assert!(block_row(&db, OTHER_V4).await.is_some());
+
+        set_exempt(&db, &["10.20.0.0/16"]).await; // covers EXEMPT_V4, not OTHER_V4
+
+        let rows = service.list_blocked_ips().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        let exempt_row = rows
+            .iter()
+            .find(|r| r.info.ip_address == EXEMPT_V4.parse::<IpAddr>().unwrap())
+            .expect("the exempt address' row is missing from the listing");
+        let other_row = rows
+            .iter()
+            .find(|r| r.info.ip_address == OTHER_V4.parse::<IpAddr>().unwrap())
+            .expect("the non-exempt address' row is missing from the listing");
+        assert!(exempt_row.is_exempt, "an exempt address' row must be flagged");
+        assert!(!other_row.is_exempt, "a normal address' row must not be flagged");
     }
 
     #[tokio::test]

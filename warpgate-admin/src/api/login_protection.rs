@@ -18,6 +18,10 @@ struct BlockedIpInfo {
     expires_at: OffsetDateTime,
     block_count: i32,
     reason: String,
+    /// True when this address is currently on the exempt list, in which
+    /// case the block is NOT enforced (a stale row can outlive the address
+    /// being exempted, or the exempt list changing after it was written).
+    is_exempt: bool,
 }
 
 #[derive(Object)]
@@ -89,12 +93,13 @@ impl Api {
         let blocked_ips = admin.services().login_protection.list_blocked_ips().await?;
         let result: Vec<BlockedIpInfo> = blocked_ips
             .into_iter()
-            .map(|info| BlockedIpInfo {
-                ip_address: info.ip_address.to_string(),
-                blocked_at: info.blocked_at,
-                expires_at: info.expires_at,
-                block_count: info.block_count,
-                reason: info.reason,
+            .map(|entry| BlockedIpInfo {
+                ip_address: entry.info.ip_address.to_string(),
+                blocked_at: entry.info.blocked_at,
+                expires_at: entry.info.expires_at,
+                block_count: entry.info.block_count,
+                reason: entry.info.reason,
+                is_exempt: entry.is_exempt,
             })
             .collect();
         Ok(ListBlockedIpsResponse::Ok(Json(result)))
