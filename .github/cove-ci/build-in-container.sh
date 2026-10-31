@@ -48,10 +48,16 @@ esac
 export DEBIAN_FRONTEND=noninteractive
 git config --global --add safe.directory '*'
 echo "---- tools ----"
-curl -fsSL https://deb.nodesource.com/setup_24.x | bash - >/dev/null
 apt-get update -qq
-apt-get install -y -qq --no-install-recommends ca-certificates-java nodejs openjdk-17-jre-headless file binutils xz-utils >/dev/null
+apt-get install -y -qq --no-install-recommends ca-certificates-java openjdk-17-jre-headless file binutils xz-utils >/dev/null
 mkdir -p /tmp/dl
+# Node: nodejs.org's tarball, checked by sha256 before it is unpacked (never a piped script).
+: "${NODE_VERSION:?}" "${NODE_SHA256:?}"
+case "$WANT_ARCH" in x86_64) NODE_ARCH=x64 ;; aarch64) NODE_ARCH=arm64 ;; esac
+curl -fsSL --retry 5 -o /tmp/dl/node.tar.xz "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz"
+echo "${NODE_SHA256}  /tmp/dl/node.tar.xz" | sha256sum -c -
+mkdir -p /opt/node && tar -xJf /tmp/dl/node.tar.xz -C /opt/node --strip-components=1
+export PATH="/opt/node/bin:$PATH"
 # Which cargo-zigbuild release asset: musl by default; the release publishes no
 # aarch64 musl asset, so the aarch64 job names the gnu one (a host tool in a
 # Debian container; it does not touch what is compiled).
