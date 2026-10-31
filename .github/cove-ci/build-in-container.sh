@@ -12,7 +12,7 @@
 #
 # Env (all required): TARGET ZIG_ARCH FEATURES LTO VERSION IS_RELEASE FORK_SHA
 #   REF RUN_ID BUILD_IMAGE ZIG_VERSION ZIG_SHA256 CARGO_ZIGBUILD_VERSION
-#   CARGO_ZIGBUILD_SHA256
+#   CARGO_ZIGBUILD_SHA256 NODE_VERSION NODE_SHA256
 # Optional: CARGO_ZIGBUILD_TRIPLE (the release asset's triple; default <ZIG_ARCH>-unknown-linux-musl)
 # Out: /out (binary, BUILDINFO, SHA256SUMS; the aarch64 target's BUILDINFO and
 #   SHA256SUMS carry the target in their names) and /web-evidence (the web
@@ -25,11 +25,12 @@ trap 'echo "---- cgroup memory ----"; cat /sys/fs/cgroup/memory.peak /sys/fs/cgr
 fail() { echo "build-static: FAILED -- $*" >&2; exit 1; }
 T0=$(date +%s)
 
-for v in TARGET ZIG_ARCH FEATURES LTO VERSION IS_RELEASE FORK_SHA REF RUN_ID BUILD_IMAGE ZIG_VERSION ZIG_SHA256 CARGO_ZIGBUILD_VERSION CARGO_ZIGBUILD_SHA256; do
+for v in TARGET ZIG_ARCH FEATURES LTO VERSION IS_RELEASE FORK_SHA REF RUN_ID BUILD_IMAGE ZIG_VERSION ZIG_SHA256 CARGO_ZIGBUILD_VERSION CARGO_ZIGBUILD_SHA256 NODE_VERSION NODE_SHA256; do
   [ -n "${!v:-}" ] || fail "$v is not set"
 done
 [[ "$ZIG_SHA256" =~ ^[0-9a-f]{64}$ ]] || fail "ZIG_SHA256 is not a 64-hex sha256 ('$ZIG_SHA256'): the pin for $ZIG_ARCH has not been filled in"
 [[ "$CARGO_ZIGBUILD_SHA256" =~ ^[0-9a-f]{64}$ ]] || fail "CARGO_ZIGBUILD_SHA256 is not a 64-hex sha256 ('$CARGO_ZIGBUILD_SHA256'): the pin for $ZIG_ARCH has not been filled in"
+[[ "$NODE_SHA256" =~ ^[0-9a-f]{64}$ ]] || fail "NODE_SHA256 is not a 64-hex sha256 ('$NODE_SHA256'): the pin for $ZIG_ARCH has not been filled in"
 
 # Which target this is, and the machine it must be. The container is of the
 # runner's architecture, so the binary can be run below.
@@ -155,6 +156,7 @@ cp "$BIN" "/out/$OUTBIN"
   echo "features: $FEATURES (sqlite by default)  lto: $LTO  profile: release, --locked"
   echo "build image: $BUILD_IMAGE"
   echo "zig: $(zig version) (sha256 $ZIG_SHA256)  cargo-zigbuild: $CARGO_ZIGBUILD_VERSION (sha256 $CARGO_ZIGBUILD_SHA256)"
+  echo "node: $NODE_VERSION (sha256 $NODE_SHA256)"
   echo "rustc: $(rustc -V)"
   echo "SOURCE_DATE_EPOCH: ${SOURCE_DATE_EPOCH:-unset}"
   echo "cargo zigbuild seconds: $took (cold, no compiler cache); whole script $(( $(date +%s) - T0 ))"
