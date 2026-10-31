@@ -82,7 +82,9 @@ name: cove-release
 # ATTESTATION: both binaries, both notices files and both SHA256SUMS get
 # GitHub's build provenance attestation. Verify with:
 #   gh attestation verify <file> --repo <owner>/warpgate \
-#     --signer-workflow <owner>/warpgate/.github/workflows/cove-release.yml
+#     --signer-workflow <owner>/warpgate/.github/workflows/cove-release.yml \
+#     --source-ref refs/tags/<tag>
+# --source-ref matters: without it any ref carrying a cove-release.yml would verify.
 #
 # BUILD_IMAGE is the forge's digest. The arm job pulls it with
 # --platform linux/arm64 and fails clearly if the digest is single-arch.
@@ -842,8 +844,8 @@ jobs:
           # An honest-mistake guard, not a security boundary (a branch can edit its own copy of this file).
           case "$EVENT:$WF_REF" in
             "push:refs/tags/$TAG") ;;
-            workflow_dispatch:refs/heads/main|workflow_dispatch:refs/heads/cove-patches-*) ;;
-            *) echo "REFUSING to publish $TAG: this $EVENT run is on '$WF_REF', not the tag's own push or a dispatch on main or a cove-patches-* branch." >&2; exit 1 ;;
+            workflow_dispatch:refs/heads/cove-patches-*) ;;
+            *) echo "REFUSING to publish $TAG: this $EVENT run is on '$WF_REF', not the tag's own push or a dispatch on a cove-patches-* branch (main never publishes)." >&2; exit 1 ;;
           esac
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -1025,7 +1027,7 @@ jobs:
             echo "Every binary, notices file and SHA256SUMS carries GitHub build provenance. Verify with:"
             echo
             echo '```'
-            echo "gh attestation verify <file> --repo $GH_REPO --signer-workflow $GH_REPO/.github/workflows/cove-release.yml"
+            echo "gh attestation verify <file> --repo $GH_REPO --signer-workflow $GH_REPO/.github/workflows/cove-release.yml --source-ref refs/tags/$TAG"
             echo '```'
             echo
             echo "BUILDINFO ends with the release record (tag, commit, sha256 of the binary and the notices, workflow run, runner image). Workflow ref of this run: $WORKFLOW_REF."
