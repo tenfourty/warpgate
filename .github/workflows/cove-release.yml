@@ -139,6 +139,11 @@ env:
   CARGO_ABOUT_VERSION: 0.9.2
   CARGO_ABOUT_SHA256: 9099a59e820c38a68b9d65f300662a567d56562f9a10f6aa4c7e86c17c2566af
   RUSTUP_TOOLCHAIN: nightly-2026-07-09
+  # Node for the web build: nodejs.org's tarball, checked by sha256 like zig (never a
+  # piped setup script). Both from nodejs.org/dist/v24.22.2/SHASUMS256.txt (31 Oct 2026).
+  NODE_VERSION: 24.22.2
+  NODE_X64_SHA256: 48cc0e21e048790e54c0cf5749c2725005313d652651c40b7a21feb9697aaf75
+  NODE_ARM64_SHA256: eb187837a2230d4047161ac0be008584e16b46f726e9c9490ee35dc6b17d9ba8
 
 jobs:
   which:
@@ -383,6 +388,7 @@ jobs:
         env:
           ZIG_SHA256: ${{ env.ZIG_X86_64_SHA256 }}
           CARGO_ZIGBUILD_SHA256: ${{ env.CARGO_ZIGBUILD_X86_64_SHA256 }}
+          NODE_SHA256: ${{ env.NODE_X64_SHA256 }}
         run: |
           set -uo pipefail
           NAME="wgstatic-${GITHUB_RUN_ID}-x86_64"
@@ -393,7 +399,7 @@ jobs:
             --ulimit nofile=65536:65536 \
             -e CARGO_BUILD_JOBS="$BUILD_CPUS" -e CARGO_INCREMENTAL=0 -e SOURCE_DATE_EPOCH=0 \
             -e FEATURES -e LTO -e TARGET -e ZIG_ARCH -e VERSION -e IS_RELEASE -e FORK_SHA -e REF -e RUN_ID -e BUILD_IMAGE \
-            -e ZIG_VERSION -e ZIG_SHA256 -e CARGO_ZIGBUILD_VERSION -e CARGO_ZIGBUILD_SHA256 \
+            -e ZIG_VERSION -e ZIG_SHA256 -e NODE_VERSION -e NODE_SHA256 -e CARGO_ZIGBUILD_VERSION -e CARGO_ZIGBUILD_SHA256 \
             -w /src "$BUILD_IMAGE" sh /sandbox-check/sandbox-exec.sh -- bash /build-in-container.sh
           docker cp "$WARPGATE_CI/build-in-container.sh" "$NAME":/build-in-container.sh
           docker cp "$WARPGATE_SRC/." "$NAME":/src
@@ -438,7 +444,8 @@ jobs:
           # never printed (a name can carry a workflow command); a fixed line says which.
           ( cd "$RUNNER_TEMP/out" && sha256sum --strict --status -c SHA256SUMS ) \
             || { echo "::error::the build's SHA256SUMS does not match the files in its /out"; exit 1; }
-          ls -la "$RUNNER_TEMP/out"
+          # C quoting: a name the container chose can never begin a line.
+          ls -la --quoting-style=c "$RUNNER_TEMP/out"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
@@ -732,6 +739,7 @@ jobs:
         env:
           ZIG_SHA256: ${{ env.ZIG_AARCH64_SHA256 }}
           CARGO_ZIGBUILD_SHA256: ${{ env.CARGO_ZIGBUILD_AARCH64_SHA256 }}
+          NODE_SHA256: ${{ env.NODE_ARM64_SHA256 }}
           CARGO_ZIGBUILD_TRIPLE: ${{ env.CARGO_ZIGBUILD_AARCH64_TRIPLE }}
         run: |
           set -uo pipefail
@@ -743,7 +751,7 @@ jobs:
             --ulimit nofile=65536:65536 \
             -e CARGO_BUILD_JOBS="$BUILD_CPUS" -e CARGO_INCREMENTAL=0 -e SOURCE_DATE_EPOCH=0 \
             -e FEATURES -e LTO -e TARGET -e ZIG_ARCH -e VERSION -e IS_RELEASE -e FORK_SHA -e REF -e RUN_ID -e BUILD_IMAGE \
-            -e ZIG_VERSION -e ZIG_SHA256 -e CARGO_ZIGBUILD_VERSION -e CARGO_ZIGBUILD_SHA256 -e CARGO_ZIGBUILD_TRIPLE \
+            -e ZIG_VERSION -e ZIG_SHA256 -e NODE_VERSION -e NODE_SHA256 -e CARGO_ZIGBUILD_VERSION -e CARGO_ZIGBUILD_SHA256 -e CARGO_ZIGBUILD_TRIPLE \
             -w /src "$BUILD_IMAGE" sh /sandbox-check/sandbox-exec.sh -- bash /build-in-container.sh
           docker cp "$WARPGATE_CI/build-in-container.sh" "$NAME":/build-in-container.sh
           docker cp "$WARPGATE_SRC/." "$NAME":/src
@@ -776,7 +784,8 @@ jobs:
           # never printed (a name can carry a workflow command); a fixed line says which.
           ( cd "$RUNNER_TEMP/out" && sha256sum --strict --status -c "SHA256SUMS-$TARGET" ) \
             || { echo "::error::the build's SHA256SUMS-$TARGET does not match the files in its /out"; exit 1; }
-          ls -la "$RUNNER_TEMP/out"
+          # C quoting: a name the container chose can never begin a line.
+          ls -la --quoting-style=c "$RUNNER_TEMP/out"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
@@ -970,7 +979,7 @@ jobs:
           fi
           cp "$GITHUB_WORKSPACE/LICENSE" "$R/LICENSE"
           printf '%s' "$RECORDS" > "$RUNNER_TEMP/records.txt"
-          ls -la "$R"
+          ls -la --quoting-style=c "$R"
 
       - name: attest the x86_64 assets
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2

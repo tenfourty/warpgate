@@ -89,7 +89,9 @@ fi
 if [ -n "$bad" ]; then
   purge
   echo "::error::sandbox-copy-out: REFUSED (exit 93): $(wc -l <<<"$bad") path(s) that are not plain single-link files or directories came out of $NAME into $DEST; the WHOLE arrival was deleted before anything read it (runcove-ll9r N6). Named, never followed:"
-  while IFS= read -r p; do printf '  %s\n' "$p"; done <<<"$bad"
+  # The names are the container's choice: printed as ONE %q-quoted string, so no name, not
+  # even one holding a newline, can begin a line of the log (a workflow command must).
+  printf '  %q\n' "$bad"
   exit 93
 fi
 # Say so, one line per copy, so the job log itself proves every copy-out went
