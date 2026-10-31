@@ -1,0 +1,1051 @@
+name: cove-release
+# THE STATIC LINUX WARPGATE RELEASE OF THE COVE FORK, on GitHub Actions
+# (runcove-adcaz.65). This is the port of runcove's warpgate-build-static.yml
+# (Forgejo): the same two static musl binaries, the same notices, the same
+# sandboxing and the same asset names, built on GitHub-hosted runners and
+# published as ONE GitHub Release. cove pins the binaries by sha256. No stored
+# secret is used: only the job's own GITHUB_TOKEN.
+#
+# TRIGGERS. A push of a tag v<upstream>-cove.<n> (the forge's release bot tags
+# there; the mirror carries the tag here) builds and publishes it. A
+# workflow_dispatch has three shapes and nothing else:
+#   - `sha` only: a PROOF build of that commit. Both targets are built and
+#     smoked, nothing is ever published, and the run is refused if the commit
+#     carries a release tag.
+#   - `tag` only: rebuild and publish that existing release tag, both targets.
+#   - `tag` and `x86_64_only`: rebuild that tag for x86_64 ONLY and publish a
+#     Release carrying the x86_64 assets and LICENSE alone, its notes saying
+#     aarch64 is missing. This keeps "a security release reaches cove the same
+#     day if aarch64 breaks". `x86_64_only` is refused without `tag`.
+# Upstream tags (v0.30.2) do not match the push pattern.
+#
+# A RELEASE IS DECIDED AS THE FORGE DECIDES IT: version.sh --is-release accepts
+# the tag, the tag points AT the commit built, exactly one release tag points
+# at that commit, and release_branch.py (fed a one-line `upstream_tag:` file
+# written from the tag, because the fork has no checks.yaml) names a
+# cove-patches-* branch that holds the commit. None of that holds for `sha`:
+# a proof build is decided non-release (thin LTO off, named by git describe).
+# A release uses THIN link-time optimisation.
+#
+# JOBS. `which` decides; `build` is the x86_64 notices container, compile
+# container, part 7 of the notices and full smoke; `notices_aarch64` writes
+# aarch64's own notices parts 1 to 6 (warpgate-notices-run.sh hard-codes the
+# x86_64 cargo-about and zig, so it runs on an x86_64 runner); `build_aarch64`
+# appends part 7, compiles NATIVELY on an arm runner and RUNS the binary in the
+# smoke (better than the forge's ELF-only check); `publish` re-checks both
+# binaries, attests, and creates the Release. On a tag publish waits for BOTH
+# targets, so a GitHub Release always carries both, except under x86_64_only.
+#
+# SANDBOXING IS AS ON THE FORGE. The fork's code runs only in the compile
+# container (create, docker cp in, sandbox-check-install.sh, start, copy out
+# through sandbox-copy-out.sh). The notices containers run none of it: the
+# commit is read as a `git archive` with data-only tools, in a container of
+# its own that is gone before the compile container exists. The hosted
+# runner's docker needs no dind; the compile container never gets the runner's
+# docker socket or any DOCKER_* setting (the self-check refuses otherwise).
+# Containers are sized from the runner (nproc and MemTotal).
+#
+# THIRD-PARTY NOTICES, one file per target (the two link different crate
+# sets): THIRD-PARTY-NOTICES.txt for x86_64 and
+# THIRD-PARTY-NOTICES-aarch64-unknown-linux-musl.txt. Parts 1 to 6 come from the
+# clean cargo-about container; part 7 (the web interface's npm packages) is
+# written once, by `build`, from its own compile's evidence read as data in a
+# clean container, and appended byte for byte to aarch64's file. THE LICENCE
+# POLICY LIVES IN runcove (warpgate-notices.py); the copy here is read, never
+# changed.
+#
+# SCRIPTS COME FROM THE CHECKED-OUT COMMIT'S .github/cove-ci. That is an
+# accepted trade: a commit carries its own copy of the machinery that builds it
+# (the sandbox wrapper is installed into the compile container from the host
+# checkout, never from the tree copied into it). runcove keeps the canonical
+# copies, and while forge CI runs its warpgate-ci suite checks that the nine
+# runcove scripts here are byte-identical to its own. build-in-container.sh and
+# elf-check.py are this repository's own.
+#
+# ASSETS of a Release (names unchanged from the forge's package):
+#   warpgate-<tag>-x86_64-unknown-linux-musl, BUILDINFO, THIRD-PARTY-NOTICES.txt, SHA256SUMS
+#   warpgate-<tag>-aarch64-unknown-linux-musl, BUILDINFO-aarch64-unknown-linux-musl,
+#   THIRD-PARTY-NOTICES-aarch64-unknown-linux-musl.txt, SHA256SUMS-aarch64-unknown-linux-musl
+#   LICENSE
+# BUILDINFO ends with the RELEASE RECORD the publish job writes outside the
+# compile container: tag, commit, the binary's sha256, the notices' sha256 and
+# how they were written, the workflow run URL and the build runner's image
+# (ImageOS and ImageVersion). The image digest and run of the forge's record are
+# gone: there is no image build here.
+#
+# PUBLISH never clobbers and never shows a half release: a Release (or draft)
+# for the tag already existing is refused; the Release is created as a DRAFT,
+# every asset is downloaded back and checked against the local files and
+# SHA256SUMS, and only then is the draft published. If the read-back fails the
+# draft is left for a person to look at and delete.
+#
+# ATTESTATION: both binaries, both notices files and both SHA256SUMS get
+# GitHub's build provenance attestation. Verify with:
+#   gh attestation verify <file> --repo <owner>/warpgate \
+#     --signer-workflow <owner>/warpgate/.github/workflows/cove-release.yml
+#
+# BUILD_IMAGE is the forge's digest. The arm job pulls it with
+# --platform linux/arm64 and fails clearly if the digest is single-arch.
+on:
+  push:
+    tags: ['v*-cove.*']
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'PROOF BUILD: the full 40-hex commit to build. Both targets are built, nothing is published, refused if the commit carries a release tag. Leave empty when giving `tag`.'
+        required: false
+        default: ''
+        type: string
+      tag:
+        description: 'An existing release tag (v<x.y.z>-cove.<n>) to rebuild and publish. Leave empty when giving `sha`.'
+        required: false
+        default: ''
+        type: string
+      x86_64_only:
+        description: 'Only with `tag`: publish a Release with the x86_64 assets and LICENSE alone (aarch64 is missing, and the notes say so).'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: cove-release-${{ inputs.tag || github.ref_name }}-${{ inputs.sha }}
+  cancel-in-progress: false
+
+# Nothing by default; every job names what it needs.
+permissions: {}
+
+env:
+  # docker/Dockerfile.cove's builder base, the forge's digest (public).
+  BUILD_IMAGE: rust:1.97.1-bookworm@sha256:408fe88047cef61a2087653b0c5255fa51c0f2d6d94ddedd7a2562a9b91a46f6
+  # The image's DB backends without rdp-openssl-tls, the graph's only path to OpenSSL.
+  FEATURES: mysql,postgres
+  ZIG_VERSION: 0.16.0
+  # x86_64: the forge's pin (ziglang.org's shasum for zig-x86_64-linux-0.16.0.tar.xz).
+  ZIG_X86_64_SHA256: 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+  # aarch64: ziglang.org/download/index.json, 0.16.0 "aarch64-linux" shasum, and confirmed
+  # by downloading zig-aarch64-linux-0.16.0.tar.xz and running sha256sum (31 Oct 2026).
+  ZIG_AARCH64_SHA256: ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17
+  CARGO_ZIGBUILD_VERSION: 0.23.3
+  # x86_64: the forge's pin (the release's cargo-zigbuild-x86_64-unknown-linux-musl.tar.xz).
+  CARGO_ZIGBUILD_X86_64_SHA256: 75c94b3f0d12d39270106852c747284521184b2f816a895576f3399e61b35af5
+  # aarch64: the v0.23.3 release publishes NO aarch64-unknown-linux-musl asset (the
+  # download answers 404). The aarch64 gnu asset is used instead: a host tool that
+  # runs in the Debian build container and does not touch what is compiled. Its
+  # sha256 is the release's own asset digest (GitHub API) and was confirmed by
+  # downloading cargo-zigbuild-aarch64-unknown-linux-gnu.tar.xz and running sha256sum (31 Oct 2026).
+  CARGO_ZIGBUILD_AARCH64_TRIPLE: aarch64-unknown-linux-gnu
+  CARGO_ZIGBUILD_AARCH64_SHA256: 364c5843f9c0cc7de620642832a6a5fba7a5e3cf825602e444c08eefb57b0391
+  # The notices' tools, as on the forge. RUSTUP_TOOLCHAIN is OUR pin, never the fork's file.
+  CARGO_ABOUT_VERSION: 0.9.2
+  CARGO_ABOUT_SHA256: 9099a59e820c38a68b9d65f300662a567d56562f9a10f6aa4c7e86c17c2566af
+  RUSTUP_TOOLCHAIN: nightly-2026-07-09
+
+jobs:
+  which:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.decide.outputs.sha }}
+      ref: ${{ steps.decide.outputs.ref }}
+      version: ${{ steps.decide.outputs.version }}
+      lto: ${{ steps.decide.outputs.lto }}
+      is_release: ${{ steps.decide.outputs.is_release }}
+      x86_only: ${{ steps.decide.outputs.x86_only }}
+      aarch64: ${{ steps.decide.outputs.aarch64 }}
+    steps:
+      # fetch-depth 0 and the tags: a release is a tag at HEAD, and the
+      # version comes from `git describe`.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event_name == 'push' && github.ref || (inputs.tag != '' && format('refs/tags/{0}', inputs.tag)) || inputs.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: decide what to build
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          PUSH_REF: ${{ github.ref }}
+          INPUT_SHA: ${{ inputs.sha }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_X86_ONLY: ${{ inputs.x86_64_only }}
+          VERSION_SH: ${{ github.workspace }}/.github/cove-ci/version.sh
+          RELEASE_BRANCH_PY: ${{ github.workspace }}/.github/cove-ci/release_branch.py
+        run: |
+          set -euo pipefail
+          refuse() { echo "REFUSING: $*" >&2; exit 64; }
+          # Which shape of run this is.
+          TAG=''; X86_ONLY=false
+          case "$EVENT" in
+            push)
+              case "$PUSH_REF" in refs/tags/*) TAG="${PUSH_REF#refs/tags/}" ;; *) refuse "a push run that is not a tag push ($PUSH_REF)." ;; esac ;;
+            workflow_dispatch)
+              [ -z "$INPUT_SHA" ] || [ -z "$INPUT_TAG" ] || refuse "give a sha (proof build) or a tag (publish), not both."
+              [ -n "$INPUT_SHA" ] || [ -n "$INPUT_TAG" ] || refuse "give a sha (proof build) or a tag (publish)."
+              if [ "$INPUT_X86_ONLY" = true ]; then
+                [ -n "$INPUT_TAG" ] || refuse "x86_64_only is valid only together with a release tag."
+                X86_ONLY=true
+              fi
+              TAG="$INPUT_TAG" ;;
+            *) refuse "event '$EVENT'." ;;
+          esac
+          SHA=$(git rev-parse HEAD)
+          if [ -n "$TAG" ]; then
+            if ! bash "$VERSION_SH" --is-release "$TAG" >/dev/null 2>&1; then refuse "tag '$TAG' is not a release tag (v<x.y.z>-cove.<n>)."; fi
+            TAG_SHA=$(git rev-parse --verify -q "refs/tags/$TAG^{commit}") || refuse "tag '$TAG' does not exist here."
+            [ "$TAG_SHA" = "$SHA" ] || refuse "checked out $SHA, tag $TAG points at $TAG_SHA."
+          else
+            case "$INPUT_SHA" in
+              *[!0-9a-f]*|'') refuse "sha '$INPUT_SHA' is not a lowercase hex commit id." ;;
+            esac
+            [ "${#INPUT_SHA}" -eq 40 ] || refuse "sha '$INPUT_SHA' is not a full 40-hex id."
+            [ "$SHA" = "$INPUT_SHA" ] || refuse "checked out $SHA, asked for $INPUT_SHA."
+            [ -n "$(git branch -r --contains "$SHA")" ] || refuse "$SHA is on no branch of this repository."
+          fi
+
+          # A release is a tag POINTING AT the commit, decided as the forge decides it.
+          RELEASE_TAGS=''
+          while IFS= read -r t; do
+            if bash "$VERSION_SH" --is-release "$t" >/dev/null 2>&1; then RELEASE_TAGS="${RELEASE_TAGS}${t}"$'\n'; fi
+          done < <(git tag --points-at "$SHA")
+          N=$(printf '%s' "$RELEASE_TAGS" | grep -c . || true)
+          if [ "${N:-0}" -gt 1 ]; then
+            echo "REFUSING TO BUILD: $N release tags point at $SHA:" >&2
+            printf '  %s\n' "$RELEASE_TAGS" >&2
+            exit 64
+          fi
+          if [ -n "$TAG" ]; then
+            [ "$(printf '%s' "$RELEASE_TAGS")" = "$TAG" ] || refuse "release tag $TAG does not point at $SHA."
+            # The branch: cove-patches-<upstream tag>, from the tag. The fork has no
+            # checks.yaml, so release_branch.py is fed a one-line file.
+            UP="${TAG%-cove.*}"
+            printf 'upstream_tag: %s\n' "$UP" > "$RUNNER_TEMP/checks.yaml"
+            BRANCH=$(python3 -I "$RELEASE_BRANCH_PY" "$RUNNER_TEMP/checks.yaml") || refuse "release_branch.py could not name the release branch of $TAG."
+            git rev-parse --verify -q "refs/remotes/origin/$BRANCH" >/dev/null || refuse "release branch '$BRANCH' does not exist here (is the mirror's branch behind its tag?)."
+            git merge-base --is-ancestor "$SHA" "refs/remotes/origin/$BRANCH" || refuse "$SHA is not on release branch $BRANCH."
+            VERSION="$TAG"; LTO=thin; IS_RELEASE=true; REF="refs/tags/$TAG"
+          else
+            [ "${N:-0}" -eq 0 ] || refuse "$SHA carries the release tag $(printf '%s' "$RELEASE_TAGS"); a proof build is for commits without one."
+            VERSION=$(git describe --tags --long "$SHA"); LTO=off; IS_RELEASE=false; REF="$SHA"
+          fi
+          case "$VERSION" in *[!A-Za-z0-9._-]*|'') refuse "version '$VERSION' is not a plain name." ;; esac
+          AARCH64=true
+          [ "$X86_ONLY" != true ] || AARCH64=false
+          {
+            echo "sha=$SHA"
+            echo "ref=$REF"
+            echo "version=$VERSION"
+            echo "lto=$LTO"
+            echo "is_release=$IS_RELEASE"
+            echo "x86_only=$X86_ONLY"
+            echo "aarch64=$AARCH64"
+          } >> "$GITHUB_OUTPUT"
+          echo "building $VERSION ($SHA, $REF), release=$IS_RELEASE, lto=$LTO, x86_64_only=$X86_ONLY"
+
+  build:
+    needs: which
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    outputs:
+      # The final file (parts 1 to 7), set by the clean npm step after the
+      # compile; the parts-1-to-6 digest, set by the clean step before it.
+      notices_sha256: ${{ steps.npm_notices.outputs.sha256 }}
+      notices_base_sha256: ${{ steps.notices.outputs.sha256 }}
+      runner_image: ${{ steps.runner.outputs.image }}
+    env:
+      DOCKER_PLATFORM: linux/amd64
+      WARPGATE_SRC: ${{ github.workspace }}
+      # Our machinery: the sandbox self-check is installed into the compile
+      # container from HERE, never from the tree copied into it.
+      WARPGATE_CI: ${{ github.workspace }}/.github/cove-ci
+      TARGET: x86_64-unknown-linux-musl
+      ZIG_ARCH: x86_64
+      NOTICES_ENGINE: ${{ github.workspace }}/.github/cove-ci/third-party-notices.py
+      VERSION: ${{ needs.which.outputs.version }}
+      LTO: ${{ needs.which.outputs.lto }}
+      IS_RELEASE: ${{ needs.which.outputs.is_release }}
+      FORK_SHA: ${{ needs.which.outputs.sha }}
+      REF: ${{ needs.which.outputs.ref }}
+      RUN_ID: ${{ github.run_id }}
+    steps:
+      # .git must come too: the binary embeds `git describe` as its version.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.which.outputs.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: the checkout is the commit that was decided on
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$FORK_SHA" ] || { echo "REFUSING: checked out $(git rev-parse HEAD), decided on $FORK_SHA." >&2; exit 64; }
+          case "$VERSION" in *[!A-Za-z0-9._-]*|'') echo "REFUSING: version '$VERSION' is not a plain name." >&2; exit 64 ;; esac
+          case "$LTO" in off|thin) ;; *) echo "REFUSING: lto '$LTO'." >&2; exit 64 ;; esac
+          case "$IS_RELEASE" in true|false) ;; *) echo "REFUSING: is_release '$IS_RELEASE'." >&2; exit 64 ;; esac
+          [ "$(uname -m)" = x86_64 ] || { echo "REFUSING: this runner is $(uname -m), not x86_64." >&2; exit 64; }
+
+      - name: size the containers from this runner, and note its image
+        id: runner
+        run: |
+          set -euo pipefail
+          cpus=$(nproc)
+          mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+          build_mb=$(( mem_kb / 1024 * 85 / 100 ))
+          notices_cpus=$(( cpus < 2 ? cpus : 2 ))
+          notices_mb=$(( build_mb < 4096 ? build_mb : 4096 ))
+          {
+            echo "BUILD_CPUS=$cpus"
+            echo "BUILD_MEM_MB=$build_mb"
+            echo "NOTICES_CPUS=$notices_cpus"
+            echo "NOTICES_MEM_MB=$notices_mb"
+          } >> "$GITHUB_ENV"
+          echo "image=${ImageOS:-unknown} ${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "compile container: $cpus cpus, ${build_mb} MiB; notices containers: $notices_cpus cpus, ${notices_mb} MiB (runner ${ImageOS:-unknown} ${ImageVersion:-unknown})"
+          docker info >/dev/null
+          docker pull --quiet --platform "$DOCKER_PLATFORM" "$BUILD_IMAGE" >/dev/null \
+            || { echo "::error::the build image could not be pulled for $DOCKER_PLATFORM"; exit 1; }
+
+      # THE NOTICES, from a container that runs none of the fork's code (the
+      # header says how). Created, run and removed here, before the compile
+      # container exists; its one file comes out through sandbox-copy-out.sh,
+      # its digest goes into this job's outputs, and the steps use it as parts 1 to 6.
+      - name: write the third-party notices (the fork read as data, in a clean container)
+        id: notices
+        env:
+          # cargo-about and zig run in the notices container, which is x86_64 on this runner.
+          ZIG_SHA256: ${{ env.ZIG_X86_64_SHA256 }}
+        run: |
+          set -uo pipefail
+          NAME="wgnotices-${GITHUB_RUN_ID}-x86_64"
+          docker rm -f "$NAME" >/dev/null 2>&1 || true
+          # The decided commit's tree as a tar. `git archive` applies the
+          # tree's own export-ignore and export-subst attributes, so a tree
+          # that uses them is refused: what is read must be the commit.
+          git -C "$WARPGATE_SRC" ls-tree -r --name-only "$FORK_SHA" > "$RUNNER_TEMP/tree-$NAME.txt"
+          if grep -Eq '(^|/)\.gitattributes$' "$RUNNER_TEMP/tree-$NAME.txt"; then
+            while IFS= read -r ga; do
+              if git -C "$WARPGATE_SRC" show "$FORK_SHA:$ga" | grep -Eq 'export-(ignore|subst)'; then
+                echo "::error::$ga uses export-ignore or export-subst: the archive would not be the commit"; exit 1
+              fi
+            done < <(git -C "$WARPGATE_SRC" ls-tree -r --name-only "$FORK_SHA" | grep -E '(^|/)\.gitattributes$')
+          fi
+          git -C "$WARPGATE_SRC" archive --format=tar -o "$RUNNER_TEMP/notices-src.tar" "$FORK_SHA" \
+            || { echo "::error::git archive of $FORK_SHA failed"; exit 1; }
+          # A failed docker create or docker cp stops the step at its own line;
+          # `set +e` below is for docker start alone.
+          set -e
+          docker create --name "$NAME" --network bridge --platform "$DOCKER_PLATFORM" \
+            --cpus "$NOTICES_CPUS" --memory "${NOTICES_MEM_MB}m" --memory-swap "${NOTICES_MEM_MB}m" \
+            -e RUSTUP_TOOLCHAIN -e CARGO_ABOUT_VERSION -e CARGO_ABOUT_SHA256 -e ZIG_VERSION -e ZIG_SHA256 \
+            -e TARGET -e FEATURES \
+            -w /notices "$BUILD_IMAGE" sh /sandbox-check/sandbox-exec.sh -- bash /warpgate-notices-run.sh
+          docker cp "$WARPGATE_CI/warpgate-notices-run.sh" "$NAME":/warpgate-notices-run.sh
+          docker cp "$WARPGATE_CI/warpgate-notices.py" "$NAME":/warpgate-notices.py
+          docker cp "$NOTICES_ENGINE" "$NAME":/third-party-notices.py
+          docker cp "$RUNNER_TEMP/notices-src.tar" "$NAME":/notices-src.tar
+          "$WARPGATE_CI/sandbox-check-install.sh" "$NAME" || { docker rm -f "$NAME" >/dev/null 2>&1 || true; exit 93; }
+          # Sandboxed output reaches this log until the resume line below: none of it runs as a workflow command.
+          tok=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+          echo "::stop-commands::$tok"
+          set +e
+          docker start -a "$NAME"
+          RC=$?
+          set -e
+          printf '\n::%s::\n' "$tok"
+          mkdir -p "$RUNNER_TEMP/notices"
+          co_rc=0; "$WARPGATE_CI/sandbox-copy-out.sh" "$NAME" /out/. "$RUNNER_TEMP/notices" 2>/dev/null || co_rc=$?
+          docker rm -f "$NAME" >/dev/null 2>&1 || true
+          [ "$co_rc" -ne 93 ] || exit 93
+          [ "$RC" -eq 0 ] || { echo "::error::the notices were not written (exit $RC); the reason is above."; exit "$RC"; }
+          [ "$co_rc" -eq 0 ] || { echo "::error::the notices could not be copied out (sandbox-copy-out exit $co_rc)."; exit 1; }
+          N="$RUNNER_TEMP/notices/THIRD-PARTY-NOTICES.txt"
+          [ "$(ls -A "$RUNNER_TEMP/notices")" = "THIRD-PARTY-NOTICES.txt" ] \
+            || { echo "::error::the notices container's /out holds more or other than THIRD-PARTY-NOTICES.txt"; exit 1; }
+          [ -f "$N" ] && [ ! -L "$N" ] && [ -s "$N" ] || { echo "::error::THIRD-PARTY-NOTICES.txt is not a plain, non-empty file"; exit 1; }
+          python3 -I -c 'import sys; open(sys.argv[1], "rb").read().decode("utf-8")' "$N" \
+            || { echo "::error::THIRD-PARTY-NOTICES.txt is not UTF-8"; exit 1; }
+          sha=$(sha256sum < "$N" | cut -d' ' -f1)
+          [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::could not take THIRD-PARTY-NOTICES.txt's sha256"; exit 1; }
+          echo "THIRD-PARTY-NOTICES.txt sha256 $sha (from the clean notices container, before any of the fork's code ran)"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+
+      # One container does all of it: the web assets (node 24 + a JRE for the
+      # OpenAPI generator), the musl compile and the in-container smoke. No
+      # secret goes in: the source is copied in, never mounted, and the sandbox
+      # wrapper checks from inside that no docker credential is visible.
+      - name: build warpgate for x86_64-unknown-linux-musl
+        env:
+          ZIG_SHA256: ${{ env.ZIG_X86_64_SHA256 }}
+          CARGO_ZIGBUILD_SHA256: ${{ env.CARGO_ZIGBUILD_X86_64_SHA256 }}
+        run: |
+          set -uo pipefail
+          NAME="wgstatic-${GITHUB_RUN_ID}-x86_64"
+          docker rm -f "$NAME" >/dev/null 2>&1 || true
+          set -e
+          docker create --name "$NAME" --network bridge --platform "$DOCKER_PLATFORM" \
+            --cpus "$BUILD_CPUS" --memory "${BUILD_MEM_MB}m" --memory-swap "${BUILD_MEM_MB}m" \
+            --ulimit nofile=65536:65536 \
+            -e CARGO_BUILD_JOBS="$BUILD_CPUS" -e CARGO_INCREMENTAL=0 -e SOURCE_DATE_EPOCH=0 \
+            -e FEATURES -e LTO -e TARGET -e ZIG_ARCH -e VERSION -e IS_RELEASE -e FORK_SHA -e REF -e RUN_ID -e BUILD_IMAGE \
+            -e ZIG_VERSION -e ZIG_SHA256 -e CARGO_ZIGBUILD_VERSION -e CARGO_ZIGBUILD_SHA256 \
+            -w /src "$BUILD_IMAGE" sh /sandbox-check/sandbox-exec.sh -- bash /build-in-container.sh
+          docker cp "$WARPGATE_CI/build-in-container.sh" "$NAME":/build-in-container.sh
+          docker cp "$WARPGATE_SRC/." "$NAME":/src
+          # The in-container sandbox self-check, from OUR checkout, delivered
+          # after every other copy so nothing can land on it. Without it
+          # verified in place, the container must not start.
+          "$WARPGATE_CI/sandbox-check-install.sh" "$NAME" || { docker rm -f "$NAME" >/dev/null 2>&1 || true; exit 93; }
+          # Sandboxed output reaches this log until the resume line below: none of it runs as a workflow command.
+          tok=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+          echo "::stop-commands::$tok"
+          set +e
+          docker start -a "$NAME"
+          RC=$?
+          set -e
+          printf '\n::%s::\n' "$tok"
+          mkdir -p "$RUNNER_TEMP/out"
+          # Out through sandbox-copy-out.sh: upload-artifact follows symlinks, so
+          # a link left in /out by branch code would upload a file of this job.
+          co_rc=0; "$WARPGATE_CI/sandbox-copy-out.sh" "$NAME" /out/. "$RUNNER_TEMP/out" 2>/dev/null || co_rc=$?
+          if [ "$co_rc" -eq 93 ]; then docker rm -f "$NAME" >/dev/null 2>&1 || true; exit 93; fi
+          # The web build's licence evidence (the bundle manifest and the source
+          # maps) comes out the same way, but not in /out: it is never uploaded
+          # or published, only read as data by the clean npm step below.
+          mkdir -p "$RUNNER_TEMP/web-evidence"
+          ev_rc=0; "$WARPGATE_CI/sandbox-copy-out.sh" "$NAME" /web-evidence/. "$RUNNER_TEMP/web-evidence" 2>/dev/null || ev_rc=$?
+          if [ "$ev_rc" -eq 93 ]; then docker rm -f "$NAME" >/dev/null 2>&1 || true; exit 93; fi
+          # A build that succeeded but whose /out did not come out cleanly
+          # uploads NOTHING: an empty or partial artefact must never read as a release.
+          if [ "$co_rc" -ne 0 ] && [ "$RC" -eq 0 ]; then
+            docker rm -f "$NAME" >/dev/null 2>&1 || true
+            echo "::error::the build succeeded but /out could not be copied out (sandbox-copy-out exit $co_rc); nothing is uploaded."
+            exit 1
+          fi
+          docker rm -f "$NAME" >/dev/null 2>&1 || true
+          [ "$RC" -eq 0 ] || { echo "::error::the build failed (exit $RC); the error is above."; exit "$RC"; }
+          [ "$ev_rc" -eq 0 ] || { echo "::error::the web build's licence evidence could not be copied out (sandbox-copy-out exit $ev_rc)."; exit 1; }
+          # The notices come only from the clean step: a copy the compile
+          # container left in /out is refused, never shipped.
+          [ ! -e "$RUNNER_TEMP/out/THIRD-PARTY-NOTICES.txt" ] \
+            || { echo "::error::the compile container's /out holds a THIRD-PARTY-NOTICES.txt; only the clean step writes it."; exit 1; }
+          # --status: the names in SHA256SUMS are the compile container's, so they are
+          # never printed (a name can carry a workflow command); a fixed line says which.
+          ( cd "$RUNNER_TEMP/out" && sha256sum --strict --status -c SHA256SUMS ) \
+            || { echo "::error::the build's SHA256SUMS does not match the files in its /out"; exit 1; }
+          ls -la "$RUNNER_TEMP/out"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: build-x86_64
+          path: ${{ runner.temp }}/out/
+          retention-days: ${{ needs.which.outputs.is_release == 'true' && 30 || 7 }}
+          compression-level: 0
+          if-no-files-found: error
+
+      # PART 7, after the compile: a second clean container, created, run and
+      # removed here. It reads the compile container's evidence as data, fetches
+      # the npm tarballs the lockfile pins, and writes parts 1 to 6 (the first
+      # container's file, unchanged) plus part 7.
+      - name: add the web interface's npm packages to the notices (the build's output read as data, in a clean container)
+        id: npm_notices
+        env:
+          NOTICES_BASE_SHA256: ${{ steps.notices.outputs.sha256 }}
+        run: |
+          set -uo pipefail
+          NAME="wgnpmnotices-${GITHUB_RUN_ID}-x86_64"
+          docker rm -f "$NAME" >/dev/null 2>&1 || true
+          B="$RUNNER_TEMP/notices/THIRD-PARTY-NOTICES.txt"
+          [[ "$NOTICES_BASE_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::the first notices step passed no digest"; exit 1; }
+          [ "$(sha256sum < "$B" | cut -d' ' -f1)" = "$NOTICES_BASE_SHA256" ] \
+            || { echo "::error::parts 1 to 6 are not what the first clean step wrote"; exit 1; }
+          set -e
+          docker create --name "$NAME" --network bridge --platform "$DOCKER_PLATFORM" \
+            --cpus "$NOTICES_CPUS" --memory "${NOTICES_MEM_MB}m" --memory-swap "${NOTICES_MEM_MB}m" \
+            -w /npm "$BUILD_IMAGE" sh /sandbox-check/sandbox-exec.sh -- bash /warpgate-notices-npm-run.sh
+          docker cp "$WARPGATE_CI/warpgate-notices-npm-run.sh" "$NAME":/warpgate-notices-npm-run.sh
+          docker cp "$WARPGATE_CI/warpgate-notices.py" "$NAME":/warpgate-notices.py
+          docker cp "$NOTICES_ENGINE" "$NAME":/third-party-notices.py
+          docker cp "$WARPGATE_CI/npm-licences" "$NAME":/npm-licences
+          docker cp "$RUNNER_TEMP/notices-src.tar" "$NAME":/notices-src.tar
+          docker cp "$RUNNER_TEMP/notices" "$NAME":/notices-base
+          docker cp "$RUNNER_TEMP/web-evidence" "$NAME":/web-evidence
+          "$WARPGATE_CI/sandbox-check-install.sh" "$NAME" || { docker rm -f "$NAME" >/dev/null 2>&1 || true; exit 93; }
+          # Sandboxed output reaches this log until the resume line below: none of it runs as a workflow command.
+          tok=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+          echo "::stop-commands::$tok"
+          set +e
+          docker start -a "$NAME"
+          RC=$?
+          set -e
+          printf '\n::%s::\n' "$tok"
+          mkdir -p "$RUNNER_TEMP/notices-final"
+          co_rc=0; "$WARPGATE_CI/sandbox-copy-out.sh" "$NAME" /out/. "$RUNNER_TEMP/notices-final" 2>/dev/null || co_rc=$?
+          docker rm -f "$NAME" >/dev/null 2>&1 || true
+          [ "$co_rc" -ne 93 ] || exit 93
+          [ "$RC" -eq 0 ] || { echo "::error::part 7 of the notices was not written (exit $RC); the reason is above."; exit "$RC"; }
+          [ "$co_rc" -eq 0 ] || { echo "::error::the notices could not be copied out (sandbox-copy-out exit $co_rc)."; exit 1; }
+          N="$RUNNER_TEMP/notices-final/THIRD-PARTY-NOTICES.txt"
+          [ "$(ls -A "$RUNNER_TEMP/notices-final")" = "THIRD-PARTY-NOTICES.txt" ] \
+            || { echo "::error::the npm notices container's /out holds more or other than THIRD-PARTY-NOTICES.txt"; exit 1; }
+          [ -f "$N" ] && [ ! -L "$N" ] && [ -s "$N" ] || { echo "::error::THIRD-PARTY-NOTICES.txt is not a plain, non-empty file"; exit 1; }
+          # One file: parts 1 to 6 byte for byte, then part 7 after them.
+          python3 -I -c 'import sys; b = open(sys.argv[1], "rb").read(); f = open(sys.argv[2], "rb").read(); f.decode("utf-8"); sys.exit(0 if len(f) > len(b) and f.startswith(b) else 1)' "$B" "$N" \
+            || { echo "::error::THIRD-PARTY-NOTICES.txt is not UTF-8, or is not parts 1 to 6 followed by part 7"; exit 1; }
+          sha=$(sha256sum < "$N" | cut -d' ' -f1)
+          [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::could not take THIRD-PARTY-NOTICES.txt's sha256"; exit 1; }
+          echo "THIRD-PARTY-NOTICES.txt sha256 $sha (parts 1 to 6, sha256 $NOTICES_BASE_SHA256, then part 7, from a clean container)"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: notices-x86_64
+          path: ${{ runner.temp }}/notices-final/
+          retention-days: ${{ needs.which.outputs.is_release == 'true' && 30 || 7 }}
+          compression-level: 0
+          if-no-files-found: error
+
+  # aarch64's OWN NOTICES, parts 1 to 6. warpgate-notices-run.sh hard-codes the
+  # x86_64 cargo-about and zig, so this runs on an x86_64 runner and cargo-about
+  # is pointed at aarch64-unknown-linux-musl; the crate set differs from x86_64's.
+  notices_aarch64:
+    needs: which
+    if: ${{ needs.which.outputs.aarch64 == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      sha256: ${{ steps.notices.outputs.sha256 }}
+    env:
+      DOCKER_PLATFORM: linux/amd64
+      WARPGATE_SRC: ${{ github.workspace }}
+      WARPGATE_CI: ${{ github.workspace }}/.github/cove-ci
+      TARGET: aarch64-unknown-linux-musl
+      NOTICES_ENGINE: ${{ github.workspace }}/.github/cove-ci/third-party-notices.py
+      FORK_SHA: ${{ needs.which.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.which.outputs.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: the checkout is the commit that was decided on, and size the container
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$FORK_SHA" ] || { echo "REFUSING: checked out $(git rev-parse HEAD), decided on $FORK_SHA." >&2; exit 64; }
+          cpus=$(nproc)
+          mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+          build_mb=$(( mem_kb / 1024 * 85 / 100 ))
+          notices_cpus=$(( cpus < 2 ? cpus : 2 ))
+          notices_mb=$(( build_mb < 4096 ? build_mb : 4096 ))
+          { echo "NOTICES_CPUS=$notices_cpus"; echo "NOTICES_MEM_MB=$notices_mb"; } >> "$GITHUB_ENV"
+          docker info >/dev/null
+          docker pull --quiet --platform "$DOCKER_PLATFORM" "$BUILD_IMAGE" >/dev/null \
+            || { echo "::error::the build image could not be pulled for $DOCKER_PLATFORM"; exit 1; }
+
+      - name: write the aarch64 third-party notices, parts 1 to 6 (the fork read as data, in a clean container)
+        id: notices
+        env:
+          # zig runs on this x86_64 container for both musl targets and cross-compiles to either.
+          ZIG_SHA256: ${{ env.ZIG_X86_64_SHA256 }}
+        run: |
+          set -uo pipefail
+          NAME="wgnotices-${GITHUB_RUN_ID}-aarch64"
+          docker rm -f "$NAME" >/dev/null 2>&1 || true
+          # The decided commit's tree as a tar (a tree using export-ignore or
+          # export-subst is refused: what is read must be the commit).
+          git -C "$WARPGATE_SRC" ls-tree -r --name-only "$FORK_SHA" > "$RUNNER_TEMP/tree-$NAME.txt"
+          if grep -Eq '(^|/)\.gitattributes$' "$RUNNER_TEMP/tree-$NAME.txt"; then
+            while IFS= read -r ga; do
+              if git -C "$WARPGATE_SRC" show "$FORK_SHA:$ga" | grep -Eq 'export-(ignore|subst)'; then
+                echo "::error::$ga uses export-ignore or export-subst: the archive would not be the commit"; exit 1
+              fi
+            done < <(git -C "$WARPGATE_SRC" ls-tree -r --name-only "$FORK_SHA" | grep -E '(^|/)\.gitattributes$')
+          fi
+          git -C "$WARPGATE_SRC" archive --format=tar -o "$RUNNER_TEMP/notices-src.tar" "$FORK_SHA" \
+            || { echo "::error::git archive of $FORK_SHA failed"; exit 1; }
+          set -e
+          docker create --name "$NAME" --network bridge --platform "$DOCKER_PLATFORM" \
+            --cpus "$NOTICES_CPUS" --memory "${NOTICES_MEM_MB}m" --memory-swap "${NOTICES_MEM_MB}m" \
+            -e RUSTUP_TOOLCHAIN -e CARGO_ABOUT_VERSION -e CARGO_ABOUT_SHA256 -e ZIG_VERSION -e ZIG_SHA256 \
+            -e TARGET -e FEATURES \
+            -w /notices "$BUILD_IMAGE" sh /sandbox-check/sandbox-exec.sh -- bash /warpgate-notices-run.sh
+          docker cp "$WARPGATE_CI/warpgate-notices-run.sh" "$NAME":/warpgate-notices-run.sh
+          docker cp "$WARPGATE_CI/warpgate-notices.py" "$NAME":/warpgate-notices.py
+          docker cp "$NOTICES_ENGINE" "$NAME":/third-party-notices.py
+          docker cp "$RUNNER_TEMP/notices-src.tar" "$NAME":/notices-src.tar
+          "$WARPGATE_CI/sandbox-check-install.sh" "$NAME" || { docker rm -f "$NAME" >/dev/null 2>&1 || true; exit 93; }
+          # Sandboxed output reaches this log until the resume line below: none of it runs as a workflow command.
+          tok=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+          echo "::stop-commands::$tok"
+          set +e
+          docker start -a "$NAME"
+          RC=$?
+          set -e
+          printf '\n::%s::\n' "$tok"
+          mkdir -p "$RUNNER_TEMP/notices"
+          co_rc=0; "$WARPGATE_CI/sandbox-copy-out.sh" "$NAME" /out/. "$RUNNER_TEMP/notices" 2>/dev/null || co_rc=$?
+          docker rm -f "$NAME" >/dev/null 2>&1 || true
+          [ "$co_rc" -ne 93 ] || exit 93
+          [ "$RC" -eq 0 ] || { echo "::error::the notices were not written (exit $RC); the reason is above."; exit "$RC"; }
+          [ "$co_rc" -eq 0 ] || { echo "::error::the notices could not be copied out (sandbox-copy-out exit $co_rc)."; exit 1; }
+          F=THIRD-PARTY-NOTICES-aarch64-unknown-linux-musl.txt
+          N="$RUNNER_TEMP/notices/$F"
+          [ "$(ls -A "$RUNNER_TEMP/notices")" = "$F" ] \
+            || { echo "::error::the notices container's /out holds more or other than $F"; exit 1; }
+          [ -f "$N" ] && [ ! -L "$N" ] && [ -s "$N" ] || { echo "::error::$F is not a plain, non-empty file"; exit 1; }
+          python3 -I -c 'import sys; open(sys.argv[1], "rb").read().decode("utf-8")' "$N" \
+            || { echo "::error::$F is not UTF-8"; exit 1; }
+          sha=$(sha256sum < "$N" | cut -d' ' -f1)
+          [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::could not take $F's sha256"; exit 1; }
+          echo "$F sha256 $sha (parts 1 to 6, from the clean notices container, before any of the fork's code ran)"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: notices-base-aarch64
+          path: ${{ runner.temp }}/notices/
+          retention-days: ${{ needs.which.outputs.is_release == 'true' && 30 || 7 }}
+          compression-level: 0
+          if-no-files-found: error
+
+  # THE AARCH64 BUILD, natively on an arm runner. It needs `build` (part 7 of the
+  # notices is that job's) and `notices_aarch64` (parts 1 to 6).
+  build_aarch64:
+    needs: [which, build, notices_aarch64]
+    if: ${{ needs.which.outputs.aarch64 == 'true' }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    outputs:
+      # The final file's digest (parts 1 to 6 plus the x86_64 file's part 7).
+      notices_sha256: ${{ steps.part7.outputs.sha256 }}
+      runner_image: ${{ steps.runner.outputs.image }}
+    env:
+      DOCKER_PLATFORM: linux/arm64
+      WARPGATE_SRC: ${{ github.workspace }}
+      WARPGATE_CI: ${{ github.workspace }}/.github/cove-ci
+      TARGET: aarch64-unknown-linux-musl
+      ZIG_ARCH: aarch64
+      NOTICES_ENGINE: ${{ github.workspace }}/.github/cove-ci/third-party-notices.py
+      VERSION: ${{ needs.which.outputs.version }}
+      LTO: ${{ needs.which.outputs.lto }}
+      IS_RELEASE: ${{ needs.which.outputs.is_release }}
+      FORK_SHA: ${{ needs.which.outputs.sha }}
+      REF: ${{ needs.which.outputs.ref }}
+      RUN_ID: ${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.which.outputs.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: the checkout is the commit that was decided on
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$FORK_SHA" ] || { echo "REFUSING: checked out $(git rev-parse HEAD), decided on $FORK_SHA." >&2; exit 64; }
+          case "$VERSION" in *[!A-Za-z0-9._-]*|'') echo "REFUSING: version '$VERSION' is not a plain name." >&2; exit 64 ;; esac
+          case "$LTO" in off|thin) ;; *) echo "REFUSING: lto '$LTO'." >&2; exit 64 ;; esac
+          case "$IS_RELEASE" in true|false) ;; *) echo "REFUSING: is_release '$IS_RELEASE'." >&2; exit 64 ;; esac
+          [ "$(uname -m)" = aarch64 ] || { echo "REFUSING: this runner is $(uname -m), not aarch64." >&2; exit 64; }
+
+      - name: size the containers from this runner, and note its image
+        id: runner
+        run: |
+          set -euo pipefail
+          cpus=$(nproc)
+          mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+          build_mb=$(( mem_kb / 1024 * 85 / 100 ))
+          { echo "BUILD_CPUS=$cpus"; echo "BUILD_MEM_MB=$build_mb"; } >> "$GITHUB_ENV"
+          echo "image=${ImageOS:-unknown} ${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "compile container: $cpus cpus, ${build_mb} MiB (runner ${ImageOS:-unknown} ${ImageVersion:-unknown})"
+          docker info >/dev/null
+          # The forge's digest must be a multi-arch index; a single-arch digest fails here, clearly.
+          docker pull --quiet --platform "$DOCKER_PLATFORM" "$BUILD_IMAGE" >/dev/null \
+            || { echo "::error::the build image could not be pulled for $DOCKER_PLATFORM (is its digest single-arch?)"; exit 1; }
+
+      # PART 7 is the same for both targets: `build` already wrote it (from its
+      # own compile's evidence, in a clean container) in the final x86_64 file.
+      # This job appends exactly those bytes to aarch64's parts 1 to 6, and checks
+      # that it did. Both inputs are artefacts, so DATA; the writer is OURS
+      # (warpgate-notices.py), run with -I.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: notices-x86_64
+          path: ${{ runner.temp }}/notices-x86
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: notices-base-aarch64
+          path: ${{ runner.temp }}/notices
+
+      - name: add the web interface's npm packages to the aarch64 notices (part 7 is the x86_64 file's, read as data)
+        id: part7
+        env:
+          X86_NOTICES_SHA256: ${{ needs.build.outputs.notices_sha256 }}
+          X86_NOTICES_BASE_SHA256: ${{ needs.build.outputs.notices_base_sha256 }}
+          ARM_NOTICES_BASE_SHA256: ${{ needs.notices_aarch64.outputs.sha256 }}
+        run: |
+          set -uo pipefail
+          for d in X86_NOTICES_SHA256 X86_NOTICES_BASE_SHA256 ARM_NOTICES_BASE_SHA256; do
+            [[ "${!d}" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::$d is not a sha256 ('${!d}')"; exit 1; }
+          done
+          X="$RUNNER_TEMP/notices-x86/THIRD-PARTY-NOTICES.txt"
+          B="$RUNNER_TEMP/notices/THIRD-PARTY-NOTICES-aarch64-unknown-linux-musl.txt"
+          F="$RUNNER_TEMP/notices-final/THIRD-PARTY-NOTICES-aarch64-unknown-linux-musl.txt"
+          [ "$(ls -A "$RUNNER_TEMP/notices-x86")" = "THIRD-PARTY-NOTICES.txt" ] && [ -f "$X" ] && [ ! -L "$X" ] \
+            || { echo "::error::the x86_64 notices artefact is not exactly one plain THIRD-PARTY-NOTICES.txt"; exit 1; }
+          [ "$(sha256sum < "$X" | cut -d' ' -f1)" = "$X86_NOTICES_SHA256" ] \
+            || { echo "::error::the x86_64 notices artefact is not what the build job wrote"; exit 1; }
+          [ "$(ls -A "$RUNNER_TEMP/notices")" = "THIRD-PARTY-NOTICES-aarch64-unknown-linux-musl.txt" ] && [ -f "$B" ] && [ ! -L "$B" ] \
+            || { echo "::error::the aarch64 notices (parts 1 to 6) are not exactly one plain THIRD-PARTY-NOTICES-aarch64-unknown-linux-musl.txt"; exit 1; }
+          [ "$(sha256sum < "$B" | cut -d' ' -f1)" = "$ARM_NOTICES_BASE_SHA256" ] \
+            || { echo "::error::the aarch64 parts 1 to 6 are not what the clean step wrote"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/notices-final"
+          python3 -I "$WARPGATE_CI/warpgate-notices.py" --engine "$NOTICES_ENGINE" --base "$B" \
+            --part7-from "$X" --part7-after-sha256 "$X86_NOTICES_BASE_SHA256" --out "$F" \
+            || { echo "::error::part 7 could not be appended; the reason is above."; exit 1; }
+          [ "$(ls -A "$RUNNER_TEMP/notices-final")" = "THIRD-PARTY-NOTICES-aarch64-unknown-linux-musl.txt" ] && [ -f "$F" ] && [ ! -L "$F" ] && [ -s "$F" ] \
+            || { echo "::error::the aarch64 final notices are not exactly one plain, non-empty THIRD-PARTY-NOTICES-aarch64-unknown-linux-musl.txt"; exit 1; }
+          # parts 1 to 6 byte for byte, then exactly the x86_64 file's part 7, UTF-8
+          python3 -I -c 'import hashlib, sys; x = open(sys.argv[1], "rb").read(); b = open(sys.argv[2], "rb").read(); f = open(sys.argv[3], "rb").read(); f.decode("utf-8"); tail = len(f) - len(b); ok = 0 < tail < len(x) and f.startswith(b) and x[len(x) - tail:] == f[len(b):] and hashlib.sha256(x[:len(x) - tail]).hexdigest() == sys.argv[4]; sys.exit(0 if ok else 1)' "$X" "$B" "$F" "$X86_NOTICES_BASE_SHA256" \
+            || { echo "::error::THIRD-PARTY-NOTICES-aarch64-unknown-linux-musl.txt is not the aarch64 parts 1 to 6 followed by the x86_64 file's part 7"; exit 1; }
+          sha=$(sha256sum < "$F" | cut -d' ' -f1)
+          [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::could not take the aarch64 notices' sha256"; exit 1; }
+          echo "THIRD-PARTY-NOTICES-aarch64-unknown-linux-musl.txt sha256 $sha (parts 1 to 6, sha256 $ARM_NOTICES_BASE_SHA256, then the x86_64 file's part 7)"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+
+      # One container does all of it: the web assets, the aarch64 musl compile and
+      # the smoke, which here RUNS the binary (this runner is aarch64).
+      - name: build warpgate for aarch64-unknown-linux-musl
+        env:
+          ZIG_SHA256: ${{ env.ZIG_AARCH64_SHA256 }}
+          CARGO_ZIGBUILD_SHA256: ${{ env.CARGO_ZIGBUILD_AARCH64_SHA256 }}
+          CARGO_ZIGBUILD_TRIPLE: ${{ env.CARGO_ZIGBUILD_AARCH64_TRIPLE }}
+        run: |
+          set -uo pipefail
+          NAME="wgstatic-${GITHUB_RUN_ID}-aarch64"
+          docker rm -f "$NAME" >/dev/null 2>&1 || true
+          set -e
+          docker create --name "$NAME" --network bridge --platform "$DOCKER_PLATFORM" \
+            --cpus "$BUILD_CPUS" --memory "${BUILD_MEM_MB}m" --memory-swap "${BUILD_MEM_MB}m" \
+            --ulimit nofile=65536:65536 \
+            -e CARGO_BUILD_JOBS="$BUILD_CPUS" -e CARGO_INCREMENTAL=0 -e SOURCE_DATE_EPOCH=0 \
+            -e FEATURES -e LTO -e TARGET -e ZIG_ARCH -e VERSION -e IS_RELEASE -e FORK_SHA -e REF -e RUN_ID -e BUILD_IMAGE \
+            -e ZIG_VERSION -e ZIG_SHA256 -e CARGO_ZIGBUILD_VERSION -e CARGO_ZIGBUILD_SHA256 -e CARGO_ZIGBUILD_TRIPLE \
+            -w /src "$BUILD_IMAGE" sh /sandbox-check/sandbox-exec.sh -- bash /build-in-container.sh
+          docker cp "$WARPGATE_CI/build-in-container.sh" "$NAME":/build-in-container.sh
+          docker cp "$WARPGATE_SRC/." "$NAME":/src
+          # The in-container sandbox self-check, from OUR checkout, delivered
+          # after every other copy so nothing can land on it.
+          "$WARPGATE_CI/sandbox-check-install.sh" "$NAME" || { docker rm -f "$NAME" >/dev/null 2>&1 || true; exit 93; }
+          # Sandboxed output reaches this log until the resume line below: none of it runs as a workflow command.
+          tok=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+          echo "::stop-commands::$tok"
+          set +e
+          docker start -a "$NAME"
+          RC=$?
+          set -e
+          printf '\n::%s::\n' "$tok"
+          mkdir -p "$RUNNER_TEMP/out"
+          co_rc=0; "$WARPGATE_CI/sandbox-copy-out.sh" "$NAME" /out/. "$RUNNER_TEMP/out" 2>/dev/null || co_rc=$?
+          if [ "$co_rc" -eq 93 ]; then docker rm -f "$NAME" >/dev/null 2>&1 || true; exit 93; fi
+          if [ "$co_rc" -ne 0 ] && [ "$RC" -eq 0 ]; then
+            docker rm -f "$NAME" >/dev/null 2>&1 || true
+            echo "::error::the build succeeded but /out could not be copied out (sandbox-copy-out exit $co_rc); nothing is uploaded."
+            exit 1
+          fi
+          docker rm -f "$NAME" >/dev/null 2>&1 || true
+          [ "$RC" -eq 0 ] || { echo "::error::the build failed (exit $RC); the error is above."; exit "$RC"; }
+          # The notices come only from the clean steps: a copy the compile
+          # container left in /out is refused, never shipped.
+          [ ! -e "$RUNNER_TEMP/out/THIRD-PARTY-NOTICES.txt" ] && [ ! -e "$RUNNER_TEMP/out/THIRD-PARTY-NOTICES-aarch64-unknown-linux-musl.txt" ] \
+            || { echo "::error::the compile container's /out holds a notices file; only the clean steps write it."; exit 1; }
+          # --status: the names in SHA256SUMS are the compile container's, so they are
+          # never printed (a name can carry a workflow command); a fixed line says which.
+          ( cd "$RUNNER_TEMP/out" && sha256sum --strict --status -c "SHA256SUMS-$TARGET" ) \
+            || { echo "::error::the build's SHA256SUMS-$TARGET does not match the files in its /out"; exit 1; }
+          ls -la "$RUNNER_TEMP/out"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: build-aarch64
+          path: ${{ runner.temp }}/out/
+          retention-days: ${{ needs.which.outputs.is_release == 'true' && 30 || 7 }}
+          compression-level: 0
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: notices-aarch64
+          path: ${{ runner.temp }}/notices-final/
+          retention-days: ${{ needs.which.outputs.is_release == 'true' && 30 || 7 }}
+          compression-level: 0
+          if-no-files-found: error
+
+  # THE PUBLISH. A release only (a proof build has nothing to publish). On a
+  # tag it needs BOTH targets; under x86_64_only the aarch64 jobs are skipped
+  # and only the x86_64 assets go out.
+  publish:
+    needs: [which, build, notices_aarch64, build_aarch64]
+    if: >-
+      ${{ !cancelled()
+      && needs.which.outputs.is_release == 'true'
+      && needs.build.result == 'success'
+      && (needs.which.outputs.x86_only == 'true'
+          || (needs.notices_aarch64.result == 'success' && needs.build_aarch64.result == 'success')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ needs.which.outputs.version }}
+      FORK_SHA: ${{ needs.which.outputs.sha }}
+      X86_ONLY: ${{ needs.which.outputs.x86_only }}
+      X86_NOTICES_SHA256: ${{ needs.build.outputs.notices_sha256 }}
+      X86_NOTICES_BASE_SHA256: ${{ needs.build.outputs.notices_base_sha256 }}
+      X86_RUNNER_IMAGE: ${{ needs.build.outputs.runner_image }}
+      ARM_NOTICES_SHA256: ${{ needs.build_aarch64.outputs.notices_sha256 }}
+      ARM_NOTICES_BASE_SHA256: ${{ needs.notices_aarch64.outputs.sha256 }}
+      ARM_RUNNER_IMAGE: ${{ needs.build_aarch64.outputs.runner_image }}
+      GH_REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: refuse unless this run is one a release may come from
+        env:
+          EVENT: ${{ github.event_name }}
+          WF_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          # An honest-mistake guard, not a security boundary (a branch can edit its own copy of this file).
+          case "$EVENT:$WF_REF" in
+            "push:refs/tags/$TAG") ;;
+            workflow_dispatch:refs/heads/main|workflow_dispatch:refs/heads/cove-patches-*) ;;
+            *) echo "REFUSING to publish $TAG: this $EVENT run is on '$WF_REF', not the tag's own push or a dispatch on main or a cove-patches-* branch." >&2; exit 1 ;;
+          esac
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.which.outputs.sha }}
+          fetch-depth: 1
+
+      # The checks below run THIS workflow's own copy of the CI scripts (github.sha, the ref the
+      # workflow came from), never the fork commit's, so the commit being checked cannot vouch for itself.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          path: wfci
+          fetch-depth: 1
+          sparse-checkout: .github/cove-ci
+
+      - name: the checkout is the commit that was decided on, and no Release exists for the tag yet
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$FORK_SHA" ] || { echo "REFUSING: checked out $(git rev-parse HEAD), decided on $FORK_SHA." >&2; exit 64; }
+          case "$TAG" in *[!A-Za-z0-9._-]*|'') echo "REFUSING: tag '$TAG' is not a plain name." >&2; exit 64 ;; esac
+          [ -f LICENSE ] && [ ! -L LICENSE ] || { echo "REFUSING: no plain LICENSE at the root of $FORK_SHA." >&2; exit 64; }
+          # gh lists drafts too (the token can write); an existing Release or draft is refused, never clobbered.
+          existing=$(gh release list --limit 1000 --json tagName --jq '.[].tagName')
+          if printf '%s\n' "$existing" | grep -Fxq -- "$TAG"; then
+            echo "REFUSING: a Release (or draft) for $TAG already exists; it is never overwritten. A person deletes the old one first." >&2
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: build-x86_64
+          path: ${{ runner.temp }}/dl/build-x86_64
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: notices-x86_64
+          path: ${{ runner.temp }}/dl/notices-x86_64
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        if: ${{ needs.which.outputs.x86_only != 'true' }}
+        with:
+          name: build-aarch64
+          path: ${{ runner.temp }}/dl/build-aarch64
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        if: ${{ needs.which.outputs.x86_only != 'true' }}
+        with:
+          name: notices-aarch64
+          path: ${{ runner.temp }}/dl/notices-aarch64
+
+      # The build container's static-ELF checks ran beside the build's own
+      # code, as root, so they could have been faked. Checked again HERE,
+      # outside any container that ran build code: the bytes are read, never executed.
+      - name: both binaries are static ELF files of their own machine (bytes read here, never run)
+        run: |
+          set -euo pipefail
+          E="$GITHUB_WORKSPACE/wfci/.github/cove-ci/elf-check.py"
+          python3 -I "$E" "$RUNNER_TEMP/dl/build-x86_64/warpgate-$TAG-x86_64-unknown-linux-musl" 62 x86-64 183 aarch64
+          if [ "$X86_ONLY" != true ]; then
+            python3 -I "$E" "$RUNNER_TEMP/dl/build-aarch64/warpgate-$TAG-aarch64-unknown-linux-musl" 183 aarch64 62 x86-64
+          fi
+
+      # Each target: the build's SHA256SUMS re-checked, the notices taken from the
+      # clean steps' artefact and checked against the digest they reported, then
+      # the release record appended to BUILDINFO and SHA256SUMS rewritten over the three.
+      - name: write the release records and assemble the assets
+        run: |
+          set -euo pipefail
+          R="$RUNNER_TEMP/release"
+          mkdir -p "$R"
+          RECORDS=''
+          # assemble TARGET INFO SUMS NOTICES NOTICES_SHA256 NOTICES_BASE_SHA256 BUILD_DIR NOTICES_DIR RUNNER_IMAGE SHARING
+          assemble() {
+            local tgt=$1 info=$2 sums=$3 notices=$4 nsha=$5 nbase=$6 bdir=$7 ndir=$8 rimage=$9 how=${10}
+            local outbin="warpgate-$TAG-$tgt" B="$RUNNER_TEMP/dl/$7" N="$RUNNER_TEMP/dl/$8"
+            [[ "$nsha" =~ ^[0-9a-f]{64}$ ]] || { echo "REFUSING: the build passed no notices digest for $tgt ('$nsha')." >&2; exit 64; }
+            [[ "$nbase" =~ ^[0-9a-f]{64}$ ]] || { echo "REFUSING: the build passed no digest of parts 1 to 6 for $tgt ('$nbase')." >&2; exit 64; }
+            local want got
+            want=$(printf '%s\n' "$info" "$outbin" "$sums" | LC_ALL=C sort)
+            got=$(ls -A "$B" | LC_ALL=C sort)
+            [ "$got" = "$want" ] || { echo "REFUSING: the $tgt build artefact is not exactly its binary, $info and $sums." >&2; exit 64; }
+            local f
+            for f in "$B/$outbin" "$B/$info" "$B/$sums"; do
+              [ -f "$f" ] && [ ! -L "$f" ] || { echo "REFUSING: a file of the $tgt build artefact is not a plain file." >&2; exit 64; }
+            done
+            # --status: the names are the compile container's, so they are never printed.
+            ( cd "$B" && sha256sum --strict --status -c "$sums" ) \
+              || { echo "REFUSING: the $tgt build artefact's $sums does not match its files." >&2; exit 64; }
+            [ "$(ls -A "$N")" = "$notices" ] && [ -f "$N/$notices" ] && [ ! -L "$N/$notices" ] \
+              || { echo "REFUSING: the $tgt notices artefact is not exactly one plain $notices." >&2; exit 64; }
+            [ "$(sha256sum < "$N/$notices" | cut -d' ' -f1)" = "$nsha" ] \
+              || { echo "REFUSING: the $tgt notices artefact is not the digest the build job reported ($nsha)." >&2; exit 64; }
+            # cove pins the notices and refuses a file that is not UTF-8.
+            python3 -I -c 'import sys; t = open(sys.argv[1], "rb").read().decode("utf-8"); sys.exit(0 if t.strip() else 1)' "$N/$notices" \
+              || { echo "REFUSING: $notices is empty or not UTF-8." >&2; exit 64; }
+            cp "$B/$outbin" "$B/$info" "$R/"
+            cp "$N/$notices" "$R/$notices"
+            local bin_sha
+            bin_sha=$(sha256sum "$R/$outbin" | cut -d' ' -f1)
+            {
+              echo
+              echo "---- release record (written by the publish job, outside the compile container) ----"
+              echo "target: $tgt"
+              echo "tag: $TAG"
+              echo "commit: $FORK_SHA"
+              echo "binary: $outbin"
+              echo "binary sha256: $bin_sha"
+              echo "notices: $notices sha256 $nsha, the final file (parts 1 to 7), checked here against the digest the build job reported; $how"
+              echo "notices parts 1 to 6: sha256 $nbase, written by a clean notices container before the compile container existed (cargo-about over the fork as data, no fork code run); part 7, the web interface's npm packages, was appended from the npm tarballs the fork's package-lock.json pins (integrity checked), the build's bundle manifest and source maps read as data"
+              echo "notices tool: cargo-about $CARGO_ABOUT_VERSION, release archive sha256 $CARGO_ABOUT_SHA256 (checked by the notices step before it ran)"
+              echo "workflow run: $RUN_URL"
+              echo "build runner image: $rimage"
+            } >> "$R/$info"
+            ( cd "$R" && sha256sum "$outbin" "$info" "$notices" > "$sums" )
+            RECORDS="$RECORDS$tgt $bin_sha $nsha $notices"$'\n'
+            # Prefixed with a visible "| ": the runner trims leading spaces before looking for "::", so a line
+            # the build wrote can never be read as a workflow command.
+            sed 's/^/| /' "$R/$info" "$R/$sums"
+          }
+          assemble x86_64-unknown-linux-musl BUILDINFO SHA256SUMS THIRD-PARTY-NOTICES.txt \
+            "$X86_NOTICES_SHA256" "$X86_NOTICES_BASE_SHA256" build-x86_64 notices-x86_64 "$X86_RUNNER_IMAGE" \
+            "built on an x86_64 runner, notices from the x86_64 build job's clean npm notices step"
+          if [ "$X86_ONLY" != true ]; then
+            assemble aarch64-unknown-linux-musl BUILDINFO-aarch64-unknown-linux-musl SHA256SUMS-aarch64-unknown-linux-musl \
+              THIRD-PARTY-NOTICES-aarch64-unknown-linux-musl.txt \
+              "$ARM_NOTICES_SHA256" "$ARM_NOTICES_BASE_SHA256" build-aarch64 notices-aarch64 "$ARM_RUNNER_IMAGE" \
+              "aarch64's own file (it links a different crate set from x86_64), whose part 7 is the x86_64 file's part 7 byte for byte; built natively on an arm runner"
+          fi
+          cp "$GITHUB_WORKSPACE/LICENSE" "$R/LICENSE"
+          printf '%s' "$RECORDS" > "$RUNNER_TEMP/records.txt"
+          ls -la "$R"
+
+      - name: attest the x86_64 assets
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: |
+            ${{ runner.temp }}/release/warpgate-${{ needs.which.outputs.version }}-x86_64-unknown-linux-musl
+            ${{ runner.temp }}/release/THIRD-PARTY-NOTICES.txt
+            ${{ runner.temp }}/release/SHA256SUMS
+
+      - name: attest the aarch64 assets
+        if: ${{ needs.which.outputs.x86_only != 'true' }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: |
+            ${{ runner.temp }}/release/warpgate-${{ needs.which.outputs.version }}-aarch64-unknown-linux-musl
+            ${{ runner.temp }}/release/THIRD-PARTY-NOTICES-aarch64-unknown-linux-musl.txt
+            ${{ runner.temp }}/release/SHA256SUMS-aarch64-unknown-linux-musl
+
+      # A DRAFT first: every asset is uploaded, downloaded back and checked, and
+      # only then published, so nobody can fetch a half Release.
+      - name: create the draft Release, read every asset back, publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          R="$RUNNER_TEMP/release"
+          X=warpgate-$TAG-x86_64-unknown-linux-musl
+          A=warpgate-$TAG-aarch64-unknown-linux-musl
+          expected=(LICENSE BUILDINFO THIRD-PARTY-NOTICES.txt SHA256SUMS "$X")
+          if [ "$X86_ONLY" != true ]; then
+            expected+=(BUILDINFO-aarch64-unknown-linux-musl THIRD-PARTY-NOTICES-aarch64-unknown-linux-musl.txt SHA256SUMS-aarch64-unknown-linux-musl "$A")
+          fi
+          want=$(printf '%s\n' "${expected[@]}" | LC_ALL=C sort)
+          [ "$(ls -A "$R" | LC_ALL=C sort)" = "$want" ] || { echo "REFUSING: the release directory is not exactly the expected assets." >&2; exit 64; }
+          {
+            echo "Static Linux Warpgate $TAG for the cove fork, built from commit $FORK_SHA by $RUN_URL"
+            echo
+            if [ "$X86_ONLY" = true ]; then
+              echo "**aarch64 is missing from this release**: the aarch64 build did not complete in time, so this Release carries the x86_64 assets and LICENSE only."
+              echo
+            fi
+            echo "Every binary, notices file and SHA256SUMS carries GitHub build provenance. Verify with:"
+            echo
+            echo '```'
+            echo "gh attestation verify <file> --repo $GH_REPO --signer-workflow $GH_REPO/.github/workflows/cove-release.yml"
+            echo '```'
+            echo
+            echo "BUILDINFO ends with the release record (tag, commit, sha256 of the binary and the notices, workflow run, runner image). Workflow ref of this run: $WORKFLOW_REF."
+          } > "$RUNNER_TEMP/notes.md"
+          files=()
+          for n in "${expected[@]}"; do files+=("$R/$n"); done
+          gh release create "$TAG" --verify-tag --draft --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md" "${files[@]}"
+
+          # Read every asset back from the draft and check it.
+          rid=$(gh api "repos/$GH_REPO/releases?per_page=100" --paginate --jq ".[] | select(.tag_name == \"$TAG\") | .id")
+          [[ "$rid" =~ ^[0-9]+$ ]] || { echo "::error::could not find exactly one draft Release for $TAG (got '$rid'); it is left for a person to look at."; exit 1; }
+          RB="$RUNNER_TEMP/readback"
+          mkdir -p "$RB"
+          gh api "repos/$GH_REPO/releases/$rid" --jq '.assets[] | select(.state == "uploaded") | "\(.id) \(.name)"' > "$RUNNER_TEMP/assets.txt"
+          got=$(cut -d' ' -f2- "$RUNNER_TEMP/assets.txt" | LC_ALL=C sort)
+          [ "$got" = "$want" ] || { echo "::error::the draft's uploaded assets are not exactly the expected ones; it is left for a person to look at."; exit 1; }
+          while IFS=' ' read -r id name; do
+            case "$name" in */*|'') echo "::error::odd asset name"; exit 1 ;; esac
+            gh api -H 'Accept: application/octet-stream' "repos/$GH_REPO/releases/assets/$id" > "$RB/$name"
+            cmp -s "$RB/$name" "$R/$name" || { echo "::error::asset $name read back from the draft differs from what was uploaded; the draft is left for a person to look at."; exit 1; }
+          done < "$RUNNER_TEMP/assets.txt"
+          ( cd "$RB" && sha256sum --strict -c SHA256SUMS ) || { echo "::error::x86_64 SHA256SUMS does not match the read-back assets"; exit 1; }
+          if [ "$X86_ONLY" != true ]; then
+            ( cd "$RB" && sha256sum --strict -c SHA256SUMS-aarch64-unknown-linux-musl ) || { echo "::error::aarch64 SHA256SUMS does not match the read-back assets"; exit 1; }
+          fi
+          gh api -X PATCH "repos/$GH_REPO/releases/$rid" -F draft=false --jq .html_url
+
+          # The lines cove pins from.
+          while IFS=' ' read -r tgt bin_sha nsha nname; do
+            [ -n "$tgt" ] || continue
+            echo "PUBLISHED tag=$TAG target=$tgt binary_sha256=$bin_sha notices=$nname notices_sha256=$nsha url=${GITHUB_SERVER_URL}/${GH_REPO}/releases/tag/$TAG"
+          done < "$RUNNER_TEMP/records.txt"
