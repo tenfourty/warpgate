@@ -17,6 +17,11 @@ name: cove-release
 #     Release carrying the x86_64 assets and LICENSE alone, its notes saying
 #     aarch64 is missing. This keeps "a security release reaches cove the same
 #     day if aarch64 breaks". `x86_64_only` is refused without `tag`.
+#   A `tag` dispatch runs ON THE TAG ITSELF and is refused from any other ref:
+#     gh workflow run cove-release.yml --ref <tag> -f tag=<tag> [-f x86_64_only=true]
+#   so the workflow that runs is the tag's own and the attestations name
+#   refs/tags/<tag>, which the verify command below requires. A `sha` proof
+#   build may be dispatched from any branch.
 # Upstream tags (v0.30.2) do not match the push pattern.
 #
 # A RELEASE IS DECIDED AS THE FORGE DECIDES IT: version.sh --is-release accepts
@@ -195,6 +200,11 @@ jobs:
               if [ "$INPUT_X86_ONLY" = true ]; then
                 [ -n "$INPUT_TAG" ] || refuse "x86_64_only is valid only together with a release tag."
                 X86_ONLY=true
+              fi
+              # A tag dispatch runs on the tag itself: its workflow is the tag's own and its
+              # attestations name refs/tags/<tag>, as the printed verify command requires.
+              if [ -n "$INPUT_TAG" ] && [ "$PUSH_REF" != "refs/tags/$INPUT_TAG" ]; then
+                refuse "a tag dispatch must run on the tag itself (gh workflow run cove-release.yml --ref $INPUT_TAG -f tag=$INPUT_TAG), not on '$PUSH_REF'."
               fi
               TAG="$INPUT_TAG" ;;
             *) refuse "event '$EVENT'." ;;
@@ -843,9 +853,8 @@ jobs:
           set -euo pipefail
           # An honest-mistake guard, not a security boundary (a branch can edit its own copy of this file).
           case "$EVENT:$WF_REF" in
-            "push:refs/tags/$TAG") ;;
-            workflow_dispatch:refs/heads/cove-patches-*) ;;
-            *) echo "REFUSING to publish $TAG: this $EVENT run is on '$WF_REF', not the tag's own push or a dispatch on a cove-patches-* branch (main never publishes)." >&2; exit 1 ;;
+            "push:refs/tags/$TAG"|"workflow_dispatch:refs/tags/$TAG") ;;
+            *) echo "REFUSING to publish $TAG: this $EVENT run is on '$WF_REF', not on the tag itself (its push, or a dispatch with --ref $TAG); a branch never publishes." >&2; exit 1 ;;
           esac
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -855,7 +864,8 @@ jobs:
           fetch-depth: 1
 
       # The checks below run THIS workflow's own copy of the CI scripts (github.sha, the ref the
-      # workflow came from), never the fork commit's, so the commit being checked cannot vouch for itself.
+      # workflow came from). A publish runs only on the tag, so there github.sha IS the tagged commit and
+      # these are the tag's own copies: the trust root is the tag's workflow, as for every step here.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
