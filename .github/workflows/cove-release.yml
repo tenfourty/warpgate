@@ -344,13 +344,18 @@ jobs:
           # The decided commit's tree as a tar. `git archive` applies the
           # tree's own export-ignore and export-subst attributes, so a tree
           # that uses them is refused: what is read must be the commit.
-          git -C "$WARPGATE_SRC" ls-tree -r --name-only "$FORK_SHA" > "$RUNNER_TEMP/tree-$NAME.txt"
+          git -C "$WARPGATE_SRC" ls-tree -r --name-only "$FORK_SHA" > "$RUNNER_TEMP/tree-$NAME.txt" \
+            || { echo "::error::git ls-tree of $FORK_SHA failed"; exit 1; }
           if grep -Eq '(^|/)\.gitattributes$' "$RUNNER_TEMP/tree-$NAME.txt"; then
+            # Each file is written out first and grepped from disk: `git show | grep -q`
+            # under pipefail reads a match as "no match" once grep exits early (SIGPIPE).
             while IFS= read -r ga; do
-              if git -C "$WARPGATE_SRC" show "$FORK_SHA:$ga" | grep -Eq 'export-(ignore|subst)'; then
+              git -C "$WARPGATE_SRC" show "$FORK_SHA:$ga" > "$RUNNER_TEMP/ga-$NAME.txt" \
+                || { echo "::error::could not read $ga at $FORK_SHA"; exit 1; }
+              if grep -Eq 'export-(ignore|subst)' "$RUNNER_TEMP/ga-$NAME.txt"; then
                 echo "::error::$ga uses export-ignore or export-subst: the archive would not be the commit"; exit 1
               fi
-            done < <(git -C "$WARPGATE_SRC" ls-tree -r --name-only "$FORK_SHA" | grep -E '(^|/)\.gitattributes$')
+            done < <(grep -E '(^|/)\.gitattributes$' "$RUNNER_TEMP/tree-$NAME.txt")
           fi
           git -C "$WARPGATE_SRC" archive --format=tar -o "$RUNNER_TEMP/notices-src.tar" "$FORK_SHA" \
             || { echo "::error::git archive of $FORK_SHA failed"; exit 1; }
@@ -581,13 +586,18 @@ jobs:
           docker rm -f "$NAME" >/dev/null 2>&1 || true
           # The decided commit's tree as a tar (a tree using export-ignore or
           # export-subst is refused: what is read must be the commit).
-          git -C "$WARPGATE_SRC" ls-tree -r --name-only "$FORK_SHA" > "$RUNNER_TEMP/tree-$NAME.txt"
+          git -C "$WARPGATE_SRC" ls-tree -r --name-only "$FORK_SHA" > "$RUNNER_TEMP/tree-$NAME.txt" \
+            || { echo "::error::git ls-tree of $FORK_SHA failed"; exit 1; }
           if grep -Eq '(^|/)\.gitattributes$' "$RUNNER_TEMP/tree-$NAME.txt"; then
+            # Each file is written out first and grepped from disk: `git show | grep -q`
+            # under pipefail reads a match as "no match" once grep exits early (SIGPIPE).
             while IFS= read -r ga; do
-              if git -C "$WARPGATE_SRC" show "$FORK_SHA:$ga" | grep -Eq 'export-(ignore|subst)'; then
+              git -C "$WARPGATE_SRC" show "$FORK_SHA:$ga" > "$RUNNER_TEMP/ga-$NAME.txt" \
+                || { echo "::error::could not read $ga at $FORK_SHA"; exit 1; }
+              if grep -Eq 'export-(ignore|subst)' "$RUNNER_TEMP/ga-$NAME.txt"; then
                 echo "::error::$ga uses export-ignore or export-subst: the archive would not be the commit"; exit 1
               fi
-            done < <(git -C "$WARPGATE_SRC" ls-tree -r --name-only "$FORK_SHA" | grep -E '(^|/)\.gitattributes$')
+            done < <(grep -E '(^|/)\.gitattributes$' "$RUNNER_TEMP/tree-$NAME.txt")
           fi
           git -C "$WARPGATE_SRC" archive --format=tar -o "$RUNNER_TEMP/notices-src.tar" "$FORK_SHA" \
             || { echo "::error::git archive of $FORK_SHA failed"; exit 1; }
@@ -882,6 +892,21 @@ jobs:
           [ "$(git rev-parse HEAD)" = "$FORK_SHA" ] || { echo "REFUSING: checked out $(git rev-parse HEAD), decided on $FORK_SHA." >&2; exit 64; }
           case "$TAG" in *[!A-Za-z0-9._-]*|'') echo "REFUSING: tag '$TAG' is not a plain name." >&2; exit 64 ;; esac
           [ -f LICENSE ] && [ ! -L LICENSE ] || { echo "REFUSING: no plain LICENSE at the root of $FORK_SHA." >&2; exit 64; }
+          # The commit the tag names now, read from GitHub (an annotated tag is
+          # dereferenced once). The tag can move during a build of several hours.
+          tag_commit() {
+            local out typ obj
+            out=$(gh api "repos/${GH_REPO:-$GITHUB_REPOSITORY}/git/ref/tags/$TAG" --jq '"\(.object.type) \(.object.sha)"') || return 1
+            typ=${out%% *}; obj=${out#* }
+            if [ "$typ" = tag ]; then
+              out=$(gh api "repos/${GH_REPO:-$GITHUB_REPOSITORY}/git/tags/$obj" --jq '"\(.object.type) \(.object.sha)"') || return 1
+              typ=${out%% *}; obj=${out#* }
+            fi
+            [ "$typ" = commit ] && [[ "$obj" =~ ^[0-9a-f]{40}$ ]] || return 1
+            printf '%s\n' "$obj"
+          }
+          now=$(tag_commit) || { echo "REFUSING: could not resolve tag $TAG to a commit on GitHub." >&2; exit 64; }
+          [ "$now" = "$FORK_SHA" ] || { echo "REFUSING: tag $TAG now points at $now, not $FORK_SHA, the commit this run built." >&2; exit 64; }
           # gh lists drafts too (the token can write); an existing Release or draft is refused, never clobbered.
           existing=$(gh release list --limit 1000 --json tagName --jq '.[].tagName')
           if printf '%s\n' "$existing" | grep -Fxq -- "$TAG"; then
@@ -1063,6 +1088,21 @@ jobs:
           if [ "$X86_ONLY" != true ]; then
             ( cd "$RB" && sha256sum --strict -c SHA256SUMS-aarch64-unknown-linux-musl ) || { echo "::error::aarch64 SHA256SUMS does not match the read-back assets"; exit 1; }
           fi
+          # The commit the tag names now, read from GitHub (an annotated tag is
+          # dereferenced once). The tag can move during a build of several hours.
+          tag_commit() {
+            local out typ obj
+            out=$(gh api "repos/${GH_REPO:-$GITHUB_REPOSITORY}/git/ref/tags/$TAG" --jq '"\(.object.type) \(.object.sha)"') || return 1
+            typ=${out%% *}; obj=${out#* }
+            if [ "$typ" = tag ]; then
+              out=$(gh api "repos/${GH_REPO:-$GITHUB_REPOSITORY}/git/tags/$obj" --jq '"\(.object.type) \(.object.sha)"') || return 1
+              typ=${out%% *}; obj=${out#* }
+            fi
+            [ "$typ" = commit ] && [[ "$obj" =~ ^[0-9a-f]{40}$ ]] || return 1
+            printf '%s\n' "$obj"
+          }
+          now=$(tag_commit) || { echo "::error::could not resolve tag $TAG on GitHub before publishing; the draft is left for a person to look at."; exit 1; }
+          [ "$now" = "$FORK_SHA" ] || { echo "::error::tag $TAG moved to $now during the build (built $FORK_SHA); the draft is left for a person to look at."; exit 1; }
           gh api -X PATCH "repos/$GH_REPO/releases/$rid" -F draft=false --jq .html_url
 
           # The lines cove pins from.
