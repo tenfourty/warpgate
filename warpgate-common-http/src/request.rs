@@ -5,7 +5,10 @@ use poem::http::header::HOST;
 use poem::http::uri::Scheme;
 use warpgate_common::http_headers::{X_FORWARDED_HOST, X_FORWARDED_PROTO};
 
-use crate::{X_WARPGATE_CLUSTER_CLIENT_IP, is_cluster_peer_request};
+use crate::{
+    X_WARPGATE_CLUSTER_CLIENT_HOST, X_WARPGATE_CLUSTER_CLIENT_IP, X_WARPGATE_CLUSTER_CLIENT_PROTO,
+    is_cluster_peer_request,
+};
 
 // proxies append to the end of XFF header
 pub fn last_forwarded_header_value(value: &str) -> Option<&str> {
@@ -15,7 +18,18 @@ pub fn last_forwarded_header_value(value: &str) -> Option<&str> {
         .find(|value| !value.is_empty())
 }
 
+/// The host the client asked for: an authenticated cluster peer's word, else
+/// `X-Forwarded-Host` when trusted, else the `Host` header.
 pub fn trusted_host_header(should_trust_x_forwarded: bool, req: &Request) -> Option<String> {
+    if is_cluster_peer_request(req)
+        && let Some(host) = req
+            .header(&X_WARPGATE_CLUSTER_CLIENT_HOST)
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+    {
+        return Some(host.to_string());
+    }
+
     if should_trust_x_forwarded
         && let Some(host) = req
             .header(&X_FORWARDED_HOST)
@@ -35,8 +49,16 @@ pub fn trusted_host_header(should_trust_x_forwarded: bool, req: &Request) -> Opt
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PlainHttpListener(pub bool);
 
+/// The scheme the client used: an authenticated cluster peer's word, else
+/// `X-Forwarded-Proto` when trusted, else the request's own scheme.
 pub fn trusted_proto(should_trust_x_forwarded: bool, req: &Request) -> Scheme {
-    if should_trust_x_forwarded
+    if is_cluster_peer_request(req)
+        && let Some(proto) = req
+            .header(&X_WARPGATE_CLUSTER_CLIENT_PROTO)
+            .and_then(|proto| Scheme::try_from(proto.trim()).ok())
+    {
+        proto
+    } else if should_trust_x_forwarded
         && let Some(proto) = req
             .header(&X_FORWARDED_PROTO)
             .and_then(last_forwarded_header_value)
@@ -253,6 +275,58 @@ mod tests {
             trusted_client_ip(&req, Some("10.0.0.1".to_string()), None),
             Some("10.0.0.1".to_string())
         );
+    }
+
+    fn cluster_peer_request(host: Option<&str>, proto: Option<&str>, peer: bool) -> Request {
+        let mut builder = Request::builder()
+            .uri_str("http://internal.example")
+            .header(HOST, "node-sni.example");
+        if let Some(value) = host {
+            builder = builder.header(&X_WARPGATE_CLUSTER_CLIENT_HOST, value);
+        }
+        if let Some(value) = proto {
+            builder = builder.header(&X_WARPGATE_CLUSTER_CLIENT_PROTO, value);
+        }
+        let mut req = builder.finish();
+        if peer {
+            req.extensions_mut().insert(ClusterPeer {
+                node_id: NodeId(Uuid::new_v4()),
+            });
+        }
+        req
+    }
+
+    #[test]
+    fn host_and_proto_take_the_forwarding_peers_word_for_them() {
+        let req = cluster_peer_request(Some("client.example:8888"), Some("https"), true);
+
+        assert_eq!(
+            trusted_host_header(false, &req),
+            Some("client.example:8888".to_string())
+        );
+        assert_eq!(trusted_proto(false, &req), Scheme::HTTPS);
+    }
+
+    #[test]
+    fn host_and_proto_ignore_cluster_headers_from_a_non_peer() {
+        let req = cluster_peer_request(Some("client.example"), Some("https"), false);
+
+        assert_eq!(
+            trusted_host_header(false, &req),
+            Some("node-sni.example".to_string())
+        );
+        assert_eq!(trusted_proto(false, &req), Scheme::HTTP);
+    }
+
+    #[test]
+    fn peer_request_without_cluster_host_falls_back_to_the_host_header() {
+        let req = cluster_peer_request(None, Some("not a scheme"), true);
+
+        assert_eq!(
+            trusted_host_header(false, &req),
+            Some("node-sni.example".to_string())
+        );
+        assert_eq!(trusted_proto(false, &req), Scheme::HTTP);
     }
 
     #[test]

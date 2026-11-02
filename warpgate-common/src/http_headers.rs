@@ -41,6 +41,12 @@ pub static X_WARPGATE_CLUSTER_IDENTITY: HeaderName =
 /// Acting origin client IP for intra cluster request
 pub static X_WARPGATE_CLUSTER_CLIENT_IP: HeaderName =
     HeaderName::from_static("x-warpgate-cluster-client-ip");
+/// Host the client asked for, as resolved by the forwarding node
+pub static X_WARPGATE_CLUSTER_CLIENT_HOST: HeaderName =
+    HeaderName::from_static("x-warpgate-cluster-client-host");
+/// Scheme the client used, as resolved by the forwarding node
+pub static X_WARPGATE_CLUSTER_CLIENT_PROTO: HeaderName =
+    HeaderName::from_static("x-warpgate-cluster-client-proto");
 
 pub fn may_forward_header(header_name: &HeaderName) -> bool {
     !DONT_FORWARD_HEADERS.contains(header_name)

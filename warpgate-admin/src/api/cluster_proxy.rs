@@ -27,12 +27,13 @@ use tokio_tungstenite::{Connector, client_async_tls_with_config, tungstenite};
 use uuid::Uuid;
 use warpgate_ca::CLUSTER_TLS_SNI_NAME;
 use warpgate_common::helpers::websocket::pump_websocket;
-use warpgate_common::http_headers::{is_forwarding_header, may_forward_header};
+use warpgate_common::http_headers::may_forward_header;
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::logging::get_client_ip;
 use warpgate_common_http::{
-    AuthenticatedRequestContext, RequestAuthorization, X_WARPGATE_CLUSTER_CLIENT_IP,
-    X_WARPGATE_CLUSTER_IDENTITY, X_WARPGATE_CLUSTER_NODE, is_cluster_peer_request,
+    AuthenticatedRequestContext, RequestAuthorization, X_WARPGATE_CLUSTER_CLIENT_HOST,
+    X_WARPGATE_CLUSTER_CLIENT_IP, X_WARPGATE_CLUSTER_CLIENT_PROTO, X_WARPGATE_CLUSTER_IDENTITY,
+    X_WARPGATE_CLUSTER_NODE, is_cluster_peer_request, trusted_host_header, trusted_proto,
 };
 use warpgate_core::Services;
 use warpgate_core::cluster::PeerConnection;
@@ -215,6 +216,22 @@ async fn forward_http_inner(
     if let Some(client_ip) = get_client_ip(req, services).await {
         request = request.header(X_WARPGATE_CLUSTER_CLIENT_IP.clone(), client_ip);
     }
+    // Likewise the host and scheme the client used, resolved here with this
+    // node's own trust settings; the client's raw forwarding headers stop here.
+    let should_trust_x_forwarded = services
+        .config
+        .lock()
+        .await
+        .store
+        .http
+        .trust_x_forwarded_headers;
+    if let Some(host) = trusted_host_header(should_trust_x_forwarded, req) {
+        request = request.header(X_WARPGATE_CLUSTER_CLIENT_HOST.clone(), host);
+    }
+    request = request.header(
+        X_WARPGATE_CLUSTER_CLIENT_PROTO.clone(),
+        trusted_proto(should_trust_x_forwarded, req).as_str(),
+    );
     if let Some(body) = body {
         request = request.body(body);
     }
@@ -308,10 +325,11 @@ fn path_and_query(req: &Request) -> String {
 /// (connection management plus any `x-warpgate-*` credential), plus message
 /// framing — the body is re-streamed, so the original framing headers don't
 /// apply — and the client's cookies: the peer hop is authorized by the node's
-/// TLS identity alone. Forwarding headers pass through so the peer resolves
-/// the same external host and scheme as this node would.
+/// TLS identity alone. The client's own forwarding headers and any
+/// `x-warpgate-cluster-*` header are dropped; the peer gets the host, scheme
+/// and address this node resolved, in cluster-only headers.
 fn should_forward(name: &HeaderName) -> bool {
-    (may_forward_header(name) || is_forwarding_header(name))
+    may_forward_header(name)
         && name != CONTENT_LENGTH
         && name != TRANSFER_ENCODING
         && name != COOKIE
@@ -347,5 +365,49 @@ pub async fn forwarded_error(response: Response) -> poem::Error {
 impl ReparseForwardedResponse for Response {
     async fn reparse_forwarded_response(response: Response) -> poem::Result<Self> {
         Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use poem::http::HeaderName;
+    use warpgate_common::http_headers::{
+        X_FORWARDED_FOR, X_FORWARDED_HOST, X_FORWARDED_PROTO, X_REAL_IP,
+    };
+    use warpgate_common_http::{
+        X_WARPGATE_CLUSTER_CLIENT_HOST, X_WARPGATE_CLUSTER_CLIENT_IP,
+        X_WARPGATE_CLUSTER_CLIENT_PROTO, X_WARPGATE_CLUSTER_IDENTITY,
+    };
+
+    use super::should_forward;
+
+    #[test]
+    fn should_forward_drops_the_clients_forwarding_headers() {
+        for name in [
+            &X_FORWARDED_FOR,
+            &X_FORWARDED_HOST,
+            &X_FORWARDED_PROTO,
+            &X_REAL_IP,
+            &poem::http::header::FORWARDED,
+        ] {
+            assert!(!should_forward(name), "{name} was forwarded");
+        }
+    }
+
+    #[test]
+    fn should_forward_drops_client_sent_cluster_headers() {
+        for name in [
+            &X_WARPGATE_CLUSTER_CLIENT_HOST,
+            &X_WARPGATE_CLUSTER_CLIENT_IP,
+            &X_WARPGATE_CLUSTER_CLIENT_PROTO,
+            &X_WARPGATE_CLUSTER_IDENTITY,
+        ] {
+            assert!(!should_forward(name), "{name} was forwarded");
+        }
+    }
+
+    #[test]
+    fn should_forward_keeps_ordinary_headers() {
+        assert!(should_forward(&HeaderName::from_static("accept")));
     }
 }
