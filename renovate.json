@@ -129,6 +129,13 @@
       ],
       "automerge": false,
       "minimumReleaseAgeBehaviour": "timestamp-required"
+    },
+    {
+      "description": "No pre-releases (alpha, beta, rc, pre, dev): an update waits for the stable release. Renovate's ignoreUnstable does not cover a dependency that is already on a pre-release, as rsa 0.10.0-rc.18 is, so this rule names the versions outright.",
+      "matchPackageNames": [
+        "*"
+      ],
+      "allowedVersions": "!/-(alpha|beta|rc|pre|dev)([.\\-]?\\d+)*$/"
     }
   ],
   "vulnerabilityAlerts": {
