@@ -298,24 +298,25 @@ mod tests {
 
     #[test]
     fn host_and_proto_take_the_forwarding_peers_word_for_them() {
-        let req = cluster_peer_request(Some("client.example:8888"), Some("https"), true);
+        // The listener default here is https, so the peer says http to be seen.
+        let req = cluster_peer_request(Some("client.example:8888"), Some("http"), true);
 
         assert_eq!(
             trusted_host_header(false, &req),
             Some("client.example:8888".to_string())
         );
-        assert_eq!(trusted_proto(false, &req), Scheme::HTTPS);
+        assert_eq!(trusted_proto(false, &req), Scheme::HTTP);
     }
 
     #[test]
     fn host_and_proto_ignore_cluster_headers_from_a_non_peer() {
-        let req = cluster_peer_request(Some("client.example"), Some("https"), false);
+        let req = cluster_peer_request(Some("client.example"), Some("http"), false);
 
         assert_eq!(
             trusted_host_header(false, &req),
             Some("node-sni.example".to_string())
         );
-        assert_eq!(trusted_proto(false, &req), Scheme::HTTP);
+        assert_eq!(trusted_proto(false, &req), Scheme::HTTPS);
     }
 
     #[test]
@@ -326,7 +327,7 @@ mod tests {
             trusted_host_header(false, &req),
             Some("node-sni.example".to_string())
         );
-        assert_eq!(trusted_proto(false, &req), Scheme::HTTP);
+        assert_eq!(trusted_proto(false, &req), Scheme::HTTPS);
     }
 
     #[test]
